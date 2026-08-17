@@ -94,8 +94,36 @@ function checkWin(ticket, drawnSet){
 
 // ===== API: Auth + OTP qua Apps Script - FIXED hỗ trợ cả GET và POST =====
 async function handleOtpSend(req,res){
-  const email = (req.body && req.body.email) || req.query.email;
-  if(!email) return res.status(400).json({ok:false, message:"Thiếu email - gửi ?email=... hoặc body {email}"});
+  const emailRaw = (req.body && req.body.email) || req.query.email;
+  if(!emailRaw) return res.status(400).json({ok:false, message:"Thiếu email - gửi ?email=... hoặc body {email}"});
+  const email = emailRaw.toLowerCase().trim();
+
+  // ===== CHECK EMAIL TỒN TẠI TRONG HỆ THỐNG - CHỐNG SPAM =====
+  try{
+    // Cách 1: check trong bảng profiles (bạn có bảng này)
+    const {data: profile} = await supabase.from('profiles').select('id,email').eq('email', email).maybeSingle();
+    
+    // Cách 2: nếu không có trong profiles, check trong auth.users qua admin API (cần SERVICE_KEY)
+    let userExists = !!profile;
+    if(!userExists){
+      try{
+        const {data: {users}, error} = await supabase.auth.admin.listUsers();
+        if(!error && users){
+          userExists = users.some(u => u.email && u.email.toLowerCase() === email);
+        }
+      }catch(e){ console.log("listUsers error", e.message); }
+    }
+
+    if(!userExists){
+      console.log("OTP blocked - email not found:", email);
+      return res.status(404).json({ok:false, message:"Email không tồn tại trong hệ thống! Vui lòng đăng ký trước."});
+    }
+  }catch(checkErr){
+    console.log("Check email exists error:", checkErr.message);
+    // Nếu lỗi check, vẫn cho qua để không block nhầm, hoặc bạn có thể return lỗi
+    // return res.status(500).json({ok:false, message:"Lỗi kiểm tra email"});
+  }
+
   const otp = Math.floor(100000+Math.random()*900000).toString();
   try{
     await supabase.from('password_otps').insert({email, otp});

@@ -369,7 +369,7 @@ io.on('connection', (socket)=>{
         text: cleanText,
         timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'})
       };
-      io.to(roomId).emit('chat-message', chatData);
+      socket.to(roomId).emit('chat-message', chatData);
       // Luu vao DB neu muon (optional)
       // await supabase.from('room_chats').insert({room_id: roomId, user_id: userId, username: chatUsername, message: cleanText});
     }catch(e){ console.log('send-chat error', e.message); }

@@ -95,18 +95,27 @@ function checkWin(ticket, drawnSet){
 // ===== API: Auth + OTP qua Apps Script =====
 app.post('/api/otp/send', async (req,res)=>{
   const {email} = req.body;
+  if(!email) return res.status(400).json({ok:false, message:"Thiếu email"});
   const otp = Math.floor(100000+Math.random()*900000).toString();
-  // lưu vào supabase
-  await supabase.from('password_otps').insert({email, otp});
-  // gọi Apps Script để gửi mail
   try{
-    await fetch(APPSCRIPT_URL, {
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({action:"sendOTP", email, otp})
-    });
-    res.json({ok:true, message:"Đã gửi OTP"});
-  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
+    await supabase.from('password_otps').insert({email, otp});
+  }catch(e){ console.log("DB insert otp error", e.message); }
+  // gọi Apps Script để gửi mail - dùng GET với query để tương thích doGet
+  try{
+    const url = `${APPSCRIPT_URL}?action=sendOTP&email=${encodeURIComponent(email)}&otp=${otp}&type=forgot&ip=${encodeURIComponent(req.ip||'')}`;
+    console.log("Calling Apps Script:", url);
+    const resp = await fetch(url);
+    const text = await resp.text();
+    console.log("Apps Script response:", text);
+    // Nếu Apps Script trả về lỗi, vẫn báo cho client biết
+    if(text.includes("❌") || text.toLowerCase().includes("error") || text.toLowerCase().includes("lỗi")){
+      return res.status(500).json({ok:false, message:text, raw:text});
+    }
+    res.json({ok:true, message:"Đã gửi OTP", raw:text});
+  }catch(e){ 
+    console.error("OTP send error", e);
+    res.status(500).json({ok:false, error:e.message}); 
+  }
 });
 
 app.post('/api/otp/verify', async (req,res)=>{

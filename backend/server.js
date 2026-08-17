@@ -258,6 +258,10 @@ io.on('connection', (socket)=>{
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
     io.to(roomId).emit('room-info', room);
+    // Thong bao co nguoi vao cho chat
+    const joinedPlayer = players.find(p=>p.user_id===userId);
+    const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
+    io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
   });
 
   socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor})=>{
@@ -278,6 +282,10 @@ io.on('connection', (socket)=>{
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
     io.to(roomId).emit('room-info', room);
+    // Thong bao co nguoi vao cho chat
+    const joinedPlayer = players.find(p=>p.user_id===userId);
+    const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
+    io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
   });
 
   socket.on('start-game', async ({roomId})=>{
@@ -336,6 +344,35 @@ io.on('connection', (socket)=>{
       const game = activeGames.get(roomId);
       if(game) game.interval = interval;
     }, 4000);
+  });
+
+  socket.on('send-chat', async ({roomId, userId, username, text})=>{
+    try{
+      if(!roomId || !text) return;
+      // Gioi han do dai tin nhan
+      const cleanText = text.toString().trim().slice(0,200);
+      if(!cleanText) return;
+      // Spam protection don gian: moi nguoi 1s 1 tin
+      const now = Date.now();
+      if(socket.data.lastChat && now - socket.data.lastChat < 800){
+        return socket.emit('error','Bạn chat quá nhanh!');
+      }
+      socket.data.lastChat = now;
+      let chatUsername = username;
+      if(!chatUsername && userId){
+        chatUsername = await getUsernameById(userId) || 'Người chơi';
+      }
+      const chatData = {
+        roomId,
+        userId,
+        username: chatUsername || 'Người chơi',
+        text: cleanText,
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'})
+      };
+      io.to(roomId).emit('chat-message', chatData);
+      // Luu vao DB neu muon (optional)
+      // await supabase.from('room_chats').insert({room_id: roomId, user_id: userId, username: chatUsername, message: cleanText});
+    }catch(e){ console.log('send-chat error', e.message); }
   });
 
   socket.on('leave-room', async ({roomId, userId, username})=>{

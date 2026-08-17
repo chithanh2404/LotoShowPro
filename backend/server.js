@@ -151,6 +151,38 @@ async function handleOtpSend(req,res){
 app.post('/api/otp/send', handleOtpSend);
 app.get('/api/otp/send', handleOtpSend);
 
+// ===== FIX: Auto-confirm email for dev (tat xac nhan email) =====
+app.post('/api/auth/confirm-all', async (req,res)=>{
+  try{
+    const {data:{users}, error} = await supabase.auth.admin.listUsers();
+    if(error) return res.status(500).json({ok:false, error:error.message});
+    let fixed = 0;
+    for(const u of users){
+      if(!u.email_confirmed_at){
+        await supabase.auth.admin.updateUserById(u.id, {email_confirm:true});
+        fixed++;
+      }
+    }
+    res.json({ok:true, message:`Da xac nhan ${fixed} user`, fixed});
+  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
+});
+
+app.get('/api/auth/confirm-all', async (req,res)=>{
+  try{
+    const {data:{users}, error} = await supabase.auth.admin.listUsers();
+    if(error) return res.status(500).json({ok:false, error:error.message});
+    let fixed = 0;
+    for(const u of users){
+      if(!u.email_confirmed_at){
+        await supabase.auth.admin.updateUserById(u.id, {email_confirm:true});
+        fixed++;
+      }
+    }
+    res.json({ok:true, message:`Da xac nhan ${fixed} user`, fixed});
+  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
+});
+
+
 
 // ===== API: Tạo vé ngẫu nhiên cho chọn =====
 app.get('/api/tickets/generate', (req,res)=>{
@@ -183,11 +215,18 @@ io.on('connection', (socket)=>{
     if(!room) return socket.emit('error','Phòng không tồn tại');
     if(room.password && room.password!==password) return socket.emit('error','Sai mật khẩu phòng');
     socket.join(roomId);
-    // nếu chưa trong phòng thì thêm
-    const {data: exist} = await supabase.from('room_players').select('*').eq('room_id',roomId).eq('user_id',userId).single();
-    if(!exist){
+    // nếu chưa trong phòng thì thêm - fix trung lap
+    const {data: existList} = await supabase.from('room_players').select('*').eq('room_id',roomId).eq('user_id',userId);
+    if(!existList || existList.length===0){
       const ticket = generateLotoTicket();
       await supabase.from('room_players').insert({room_id:roomId, user_id:userId, ticket});
+    } else if(existList.length>1){
+      // Xoa ban trung lap neu co
+      console.log(`Duplicate entries found for user ${userId} in room ${roomId}: ${existList.length}, cleaning...`);
+      // Giu lai 1 ban ghi dau tien, xoa cac ban con lai
+      for(let i=1;i<existList.length;i++){
+        await supabase.from('room_players').delete().eq('id', existList[i].id);
+      }
     }
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);

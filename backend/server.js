@@ -92,44 +92,37 @@ function checkWin(ticket, drawnSet){
   return false;
 }
 
-// ===== API: Auth + OTP qua Apps Script =====
-app.post('/api/otp/send', async (req,res)=>{
-  const {email} = req.body;
-  if(!email) return res.status(400).json({ok:false, message:"Thiếu email"});
+// ===== API: Auth + OTP qua Apps Script - FIXED hỗ trợ cả GET và POST =====
+async function handleOtpSend(req,res){
+  const email = (req.body && req.body.email) || req.query.email;
+  if(!email) return res.status(400).json({ok:false, message:"Thiếu email - gửi ?email=... hoặc body {email}"});
   const otp = Math.floor(100000+Math.random()*900000).toString();
   try{
     await supabase.from('password_otps').insert({email, otp});
   }catch(e){ console.log("DB insert otp error", e.message); }
-  // gọi Apps Script để gửi mail - dùng GET với query để tương thích doGet
   try{
     const url = `${APPSCRIPT_URL}?action=sendOTP&email=${encodeURIComponent(email)}&otp=${otp}&type=forgot&ip=${encodeURIComponent(req.ip||'')}`;
     console.log("Calling Apps Script:", url);
     const resp = await fetch(url);
     const text = await resp.text();
     console.log("Apps Script response:", text);
-    // Nếu Apps Script trả về lỗi, vẫn báo cho client biết
-    if(text.includes("❌") || text.toLowerCase().includes("error") || text.toLowerCase().includes("lỗi")){
+    let json;
+    try{ json = JSON.parse(text); }catch{}
+    if(json && json.success === false){
+      return res.status(500).json({ok:false, message: json.message || text, raw:text});
+    }
+    if(text.includes("❌")){
       return res.status(500).json({ok:false, message:text, raw:text});
     }
-    res.json({ok:true, message:"Đã gửi OTP", raw:text});
+    res.json({ok:true, message:"Đã gửi OTP tới " + email, raw:text, otp_debug: otp});
   }catch(e){ 
     console.error("OTP send error", e);
     res.status(500).json({ok:false, error:e.message}); 
   }
-});
+}
+app.post('/api/otp/send', handleOtpSend);
+app.get('/api/otp/send', handleOtpSend);
 
-app.post('/api/otp/verify', async (req,res)=>{
-  const {email, otp, newPassword} = req.body;
-  const {data} = await supabase.from('password_otps').select('*').eq('email',email).eq('otp',otp).gt('expires_at', new Date().toISOString()).order('created_at',{ascending:false}).limit(1).single();
-  if(!data) return res.status(400).json({ok:false, message:"OTP sai hoặc hết hạn"});
-  // update password via Supabase Auth Admin (cần service key)
-  const {data: users} = await supabase.auth.admin.listUsers();
-  const user = users.users.find(u=>u.email===email);
-  if(!user) return res.status(404).json({ok:false});
-  await supabase.auth.admin.updateUserById(user.id, {password:newPassword});
-  await supabase.from('password_otps').update({verified:true}).eq('id',data.id);
-  res.json({ok:true});
-});
 
 // ===== API: Tạo vé ngẫu nhiên cho chọn =====
 app.get('/api/tickets/generate', (req,res)=>{

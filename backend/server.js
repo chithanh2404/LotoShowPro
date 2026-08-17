@@ -198,12 +198,12 @@ app.post('/api/rooms', async (req,res)=>{
   if(error) return res.status(500).json({error});
   const finalTicket = ticket || generateLotoTicket();
   const username = await getUsernameById(hostId);
-  // Them mau sac cho ve
   const ticketColor = req.body.ticketColor || '#00d2ff';
   await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false});
   res.json(data);
 });
 
+// API lay danh sach ve da duoc chon trong phong - de an di cho nguoi khac
 app.get('/api/rooms/:roomId/taken-tickets', async (req,res)=>{
   const {roomId} = req.params;
   try{
@@ -211,22 +211,27 @@ app.get('/api/rooms/:roomId/taken-tickets', async (req,res)=>{
     if(error) return res.status(500).json({error: error.message});
     const takenTickets = players ? players.map(p=>p.ticket).filter(t=>t) : [];
     res.json({roomId, takenTickets, count: takenTickets.length});
-  }catch(e){ res.status(500).json({error: e.message}); }
+  }catch(e){
+    res.status(500).json({error: e.message});
+  }
 });
 
+// API lay thong tin phong chi tiet - kiem tra co bot khong
 app.get('/api/rooms/:roomId', async (req,res)=>{
   const {roomId} = req.params;
   try{
-    const {data: room} = await supabase.from('rooms').select('*').eq('id', roomId).single();
-    if(!room) return res.status(404).json({error: 'Phong khong ton tai'});
+    const {data: room, error} = await supabase.from('rooms').select('*').eq('id', roomId).single();
+    if(error) return res.status(404).json({error: 'Phong khong ton tai'});
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id', roomId);
     const hasBots = players ? players.some(p=>p.is_bot) : false;
-    res.json({...room, players, hasBots, totalPlayers: players ? players.length : 0});
-  }catch(e){ res.status(500).json({error: e.message}); }
+    const realPlayers = players ? players.filter(p=>!p.is_bot) : [];
+    res.json({...room, players, hasBots, realPlayersCount: realPlayers.length, totalPlayers: players ? players.length : 0});
+  }catch(e){
+    res.status(500).json({error: e.message});
+  }
 });
 
-// ===== SOCKET.IO GAME LOOP ===
-
+// ===== SOCKET.IO GAME LOOP =====
 const activeGames = new Map(); // roomId -> {drawn, interval, numbers, players, originalPlayers, roomData}
 
 io.on('connection', (socket)=>{
@@ -252,6 +257,7 @@ io.on('connection', (socket)=>{
     }
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
+    io.to(roomId).emit('room-info', room);
   });
 
   socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor})=>{
@@ -271,6 +277,7 @@ io.on('connection', (socket)=>{
     socket.emit('solo-created', {roomId, fee});
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
+    io.to(roomId).emit('room-info', room);
   });
 
   socket.on('start-game', async ({roomId})=>{

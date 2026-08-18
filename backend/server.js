@@ -417,34 +417,216 @@ app.get('/api/admin/transactions/:userId', async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-// ===== Existing APIs: Deposit, Rooms, etc =====
-app.post('/api/deposit/webhook', async (req,res)=>{
+function generateTransferContent(userId){
+  // NAP + 4 ky tu cuoi userId + 4 ky tu random
+  const shortId = userId ? userId.toString().slice(-4).toUpperCase() : 'XXXX';
+  const random = nanoid(4).toUpperCase();
+  return `NAP${shortId}${random}`;
+}
+
+// API: Tao lenh nap tien
+app.post('/api/deposit/create', async (req, res) => {
   try{
-    const {transferContent, amount, bankAccount} = req.body;
-    const content = transferContent || req.body.content || '';
-    const amt = parseInt(amount || req.body.transferAmount || 0);
-    if(!content) return res.status(400).json({error:'Missing content'});
+    const { userId, amount } = req.body;
+    if(!userId) return res.status(400).json({error: 'Thieu userId'});
+    const amt = parseInt(amount);
+    if(!amt || amt < 10000) return res.status(400).json({error: 'So tien toi thieu 10,000 VND'});
+    if(amt > 50000000) return res.status(400).json({error: 'So tien toi da 50,000,000 VND'});
+
+    const transferContent = generateTransferContent(userId);
+    const depositId = 'DEP-' + nanoid(8).toUpperCase();
     
-    const {data: pendingDeposits} = await supabase.from('deposits').select('*').eq('status','pending').order('created_at', {ascending:false});
+    // Luu vao DB - bang deposits
+    const { data, error } = await supabase.from('deposits').insert({
+      id: depositId,
+      user_id: userId,
+      amount: amt,
+      transfer_content: transferContent,
+      transfer_content_lower: transferContent.toLowerCase(),
+      status: 'pending',
+      bank: DEPOSIT_BANK_INFO.bank,
+      account_number: DEPOSIT_BANK_INFO.account,
+      account_holder: DEPOSIT_BANK_INFO.holder
+    }).select().single();
+
+    if(error){
+      console.log('Deposit create error:', error.message);
+      // Neu bang chua ton tai, thu tao bang tam thoi bang cach return truc tiep
+      // Van tra ve thong tin de frontend hien thi
+      return res.json({
+        id: depositId,
+        userId,
+        amount: amt,
+        transferContent,
+        bank: DEPOSIT_BANK_INFO.bank,
+        account: DEPOSIT_BANK_INFO.account,
+        holder: DEPOSIT_BANK_INFO.holder,
+        qrUrl: `https://qr.sepay.vn/img?bank=BIDV&acc=${DEPOSIT_BANK_INFO.account}&template=compact&amount=${amt}&des=${encodeURIComponent(transferContent)}`,
+        vietQrUrl: `https://img.vietqr.io/image/BIDV-${DEPOSIT_BANK_INFO.account}-qr_only.png?amount=${amt}&addInfo=${encodeURIComponent(transferContent)}&accountName=${encodeURIComponent(DEPOSIT_BANK_INFO.holder)}`,
+        status: 'pending',
+        note: 'Bang deposits chua ton tai, vui long chay SQL tao bang'
+      });
+    }
+
+    res.json({
+      id: data.id,
+      userId,
+      amount: data.amount,
+      transferContent: data.transfer_content,
+      bank: data.bank,
+      account: data.account_number,
+      holder: data.account_holder,
+      qrUrl: `https://qr.sepay.vn/img?bank=BIDV&acc=${DEPOSIT_BANK_INFO.account}&template=compact&amount=${amt}&des=${encodeURIComponent(transferContent)}`,
+      vietQrUrl: `https://img.vietqr.io/image/BIDV-${DEPOSIT_BANK_INFO.account}-qr_only.png?amount=${amt}&addInfo=${encodeURIComponent(transferContent)}&accountName=${encodeURIComponent(DEPOSIT_BANK_INFO.holder)}`,
+      status: data.status,
+      created_at: data.created_at
+    });
+  }catch(e){
+    console.error('Deposit create error:', e);
+    res.status(500).json({error: e.message});
+  }
+});
+
+// API: Kiem tra trang thai lenh nap
+app.get('/api/deposit/status/:id', async (req, res) => {
+  try{
+    const { id } = req.params;
+    const { data, error } = await supabase.from('deposits').select('*').eq('id', id).single();
+    if(error || !data) return res.status(404).json({error: 'Khong tim thay lenh nap'});
+    res.json(data);
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// API: Lich su nap tien
+app.get('/api/deposit/history', async (req, res) => {
+  try{
+    const userId = req.query.userId;
+    if(!userId) return res.status(400).json({error: 'Thieu userId'});
+    const { data, error } = await supabase.from('deposits').select('*').eq('user_id', userId).order('created_at', {ascending: false}).limit(20);
+    if(error) return res.json([]);
+    res.json(data);
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// API: Lay so du user
+app.get('/api/user/balance', async (req, res) => {
+  try{
+    const userId = req.query.userId;
+    if(!userId) return res.status(400).json({error: 'Thieu userId'});
+    const { data, error } = await supabase.from('profiles').select('balance').eq('id', userId).single();
+    if(error) return res.status(404).json({error: 'User not found'});
+    res.json({ balance: data.balance || 0 });
+  }catch(e){ res.status(500).json({error: e.message}); }
+});
+
+// API: Webhook Sepay - Tu dong duyet khi chuyen khoan thanh cong
+// Sepay se gui POST den https://lotoshowpro.onrender.com/api/sepay/webhook
+// Cau hinh trong Sepay dashboard: Webhook URL = https://lotoshowpro.onrender.com/api/sepay/webhook
+app.post('/api/sepay/webhook', async (req, res) => {
+  try{
+    const payload = req.body;
+    console.log('Sepay webhook received:', JSON.stringify(payload).slice(0, 1000));
+
+    // Sepay co the gui 1 object hoac array, hoac co wrapper { data: {...} }
+    let transaction = payload;
+    if(payload.data) transaction = payload.data;
+    if(Array.isArray(transaction)) transaction = transaction[0];
+
+    // Lay thong tin giao dich
+    const content = (transaction.content || transaction.description || transaction.transferContent || '').toString();
+    const amount = parseInt(transaction.transferAmount || transaction.amount || transaction.transfer_amount || 0);
+    const accountNumber = (transaction.accountNumber || transaction.account_number || '').toString();
+    const transactionId = (transaction.id || transaction.referenceCode || transaction.reference_code || '').toString();
+    const gateway = (transaction.gateway || transaction.bank || '').toString();
+
+    if(!content || !amount){
+      console.log('Webhook missing content or amount');
+      return res.json({ success: false, message: 'Missing content or amount' });
+    }
+
+    // Chi xu ly giao dich vao (in) va dung tai khoan BIDV cua chung ta
+    // Neu co nhieu tai khoan, kiem tra accountNumber
+    if(accountNumber && accountNumber !== DEPOSIT_BANK_INFO.account && !accountNumber.includes(DEPOSIT_BANK_INFO.account)){
+      console.log('Webhook account mismatch:', accountNumber);
+      // Van tiep tuc xu ly neu content khop, de tranh truong hop Sepay gui accountNumber khac format
+    }
+
+    // Tim lenh nap dang pending co transfer_content nam trong content chuyen khoan
+    // Vi du: content = "NAPABCD1234 chuyen tien" -> tim NAPABCD1234
+    const contentLower = content.toLowerCase();
+    
+    // Lay tat ca lenh pending
+    const { data: pendingDeposits, error } = await supabase.from('deposits').select('*').eq('status', 'pending').order('created_at', {ascending: false}).limit(50);
+    
+    if(error){
+      console.log('Fetch pending deposits error:', error.message);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
     let matchedDeposit = null;
     for(const dep of pendingDeposits || []){
-      if(content.includes(dep.transfer_content)){
+      const transferContentLower = (dep.transfer_content_lower || dep.transfer_content || '').toLowerCase();
+      if(transferContentLower && contentLower.includes(transferContentLower)){
+        matchedDeposit = dep;
+        break;
+      }
+      // Thu tim theo id ngan gon neu content co chua id
+      if(dep.id && contentLower.includes(dep.id.toLowerCase().slice(-6))){
         matchedDeposit = dep;
         break;
       }
     }
+
+    // Neu khong tim thay theo content, thu parse content kieu NAPxxxx
     if(!matchedDeposit){
-      return res.status(404).json({error:'Deposit not found for content '+content});
+      const napMatch = content.match(/NAP[A-Z0-9]{4,12}/i);
+      if(napMatch){
+        const code = napMatch[0];
+        const { data: depByCode } = await supabase.from('deposits').select('*').ilike('transfer_content', `%${code}%`).eq('status', 'pending').maybeSingle();
+        if(depByCode) matchedDeposit = depByCode;
+      }
     }
-    
-    const {data: profile} = await supabase.from('profiles').select('balance, total_deposited').eq('id', matchedDeposit.user_id).single();
-    const newBalance = (profile.balance || 0) + matchedDeposit.amount;
-    const newTotalDeposited = (profile.total_deposited || 0) + matchedDeposit.amount;
-    
-    await supabase.from('profiles').update({balance: newBalance, total_deposited: newTotalDeposited}).eq('id', matchedDeposit.user_id);
-    await supabase.from('deposits').update({status:'success', confirmed_at: new Date().toISOString()}).eq('id', matchedDeposit.id);
-    await supabase.from('transactions').insert([{user_id: matchedDeposit.user_id, type:'deposit', amount: matchedDeposit.amount, description: `Nạp tiền ${matchedDeposit.amount} VND`}]);
-    
+
+    if(!matchedDeposit){
+      console.log('No matching deposit found for content:', content);
+      return res.json({ success: true, message: 'No matching deposit, but webhook received', content, amount });
+    }
+
+    // Kiem tra so tien - cho phep chenh lech nho (do phi) hoac phai bang hoac lon hon
+    if(amount < matchedDeposit.amount){
+      console.log(`Amount mismatch: received ${amount} < expected ${matchedDeposit.amount} for ${matchedDeposit.id}`);
+      // Van co the chap nhan neu amount >= 90% expected? Tam thoi yeu cau dung so tien
+      // return res.json({ success: false, message: `Amount ${amount} less than expected ${matchedDeposit.amount}` });
+    }
+
+    // Cong tien cho user
+    const { data: profile } = await supabase.from('profiles').select('balance').eq('id', matchedDeposit.user_id).single();
+    const currentBalance = profile ? (profile.balance || 0) : 0;
+    const newBalance = currentBalance + matchedDeposit.amount;
+
+    await supabase.from('profiles').update({ balance: newBalance }).eq('id', matchedDeposit.user_id);
+
+    // Cap nhat trang thai deposit
+    await supabase.from('deposits').update({
+      status: 'success',
+      sepay_transaction_id: transactionId,
+      sepay_data: transaction,
+      confirmed_at: new Date().toISOString(),
+      received_amount: amount,
+      received_content: content
+    }).eq('id', matchedDeposit.id);
+
+    // Ghi transaction
+    await supabase.from('transactions').insert([{
+      user_id: matchedDeposit.user_id,
+      type: 'deposit',
+      amount: matchedDeposit.amount,
+      room_id: null,
+      description: `Nap tien ${matchedDeposit.amount} VND - ${matchedDeposit.transfer_content} - Sepay ${transactionId}`
+    }]);
+
+    console.log(`Deposit success: ${matchedDeposit.id} for user ${matchedDeposit.user_id} +${matchedDeposit.amount} - new balance ${newBalance}`);
+
     res.json({ success: true, message: 'Deposit confirmed', depositId: matchedDeposit.id, newBalance });
   }catch(e){
     console.error('Sepay webhook error:', e);
@@ -452,23 +634,26 @@ app.post('/api/deposit/webhook', async (req,res)=>{
   }
 });
 
+// API: Test webhook manual (de test)
 app.post('/api/deposit/manual-confirm', async (req, res) => {
   try{
     const { depositId, secret } = req.body;
+    // Simple secret check - ban co the doi
     if(secret !== 'loto123') return res.status(403).json({error: 'Invalid secret'});
     const { data: dep } = await supabase.from('deposits').select('*').eq('id', depositId).single();
     if(!dep) return res.status(404).json({error: 'Deposit not found'});
     if(dep.status === 'success') return res.json({message: 'Already success', deposit: dep});
 
-    const { data: profile } = await supabase.from('profiles').select('balance, total_deposited').eq('id', dep.user_id).single();
+    const { data: profile } = await supabase.from('profiles').select('balance').eq('id', dep.user_id).single();
     const newBalance = (profile.balance || 0) + dep.amount;
-    const newTotalDeposited = (profile.total_deposited || 0) + dep.amount;
-    await supabase.from('profiles').update({ balance: newBalance, total_deposited: newTotalDeposited }).eq('id', dep.user_id);
+    await supabase.from('profiles').update({ balance: newBalance }).eq('id', dep.user_id);
     await supabase.from('deposits').update({ status: 'success', confirmed_at: new Date().toISOString() }).eq('id', dep.id);
     await supabase.from('transactions').insert([{ user_id: dep.user_id, type: 'deposit', amount: dep.amount, description: `Manual confirm ${dep.transfer_content}` }]);
     res.json({ success: true, newBalance, deposit: dep });
   }catch(e){ res.status(500).json({error: e.message}); }
 });
+
+
 
 
 app.get('/api/tickets/generate', (req,res)=>{

@@ -834,6 +834,66 @@ io.on('connection', (socket)=>{
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
+
+    // ===== FIX: Cập nhật số lượng máy khi có người vào giữa trận =====
+    try{
+      const game = activeGames.get(roomId);
+      if(game){
+        // Nếu phòng đang chơi, thêm người chơi vào game và cập nhật expectedAcks
+        const realPlayersNow = players.filter(p=>!p.is_bot);
+        const oldExpected = game.expectedAcks;
+        const newExpected = Math.max(1, realPlayersNow.length);
+        
+        // Kiểm tra xem player đã có trong game chưa
+        const alreadyInGame = game.players.some(p=>p.user_id===userId && !p.is_bot);
+        if(!alreadyInGame){
+          // Thêm player mới vào danh sách game
+          const newPlayerData = players.find(p=>p.user_id===userId);
+          if(newPlayerData){
+            game.players.push(newPlayerData);
+            game.originalPlayers.push(newPlayerData);
+          }
+        }
+        
+        if(newExpected !== oldExpected){
+          console.log(`[PLAYER JOINED MID-GAME] ${roomId} - Player ${joinedUsername} (${userId}) joined during game. expectedAcks ${oldExpected} -> ${newExpected} (total real players: ${realPlayersNow.length})`);
+          game.expectedAcks = newExpected;
+          
+          // Gửi thông tin cập nhật cho tất cả clients
+          io.to(roomId).emit('sync-player-count-updated', {
+            roomId,
+            oldExpected,
+            newExpected,
+            totalPlayers: realPlayersNow.length,
+            joinedUserId: userId,
+            joinedUsername,
+            message: `Có người mới vào phòng, giờ cần chờ ${newExpected} máy`
+          });
+          
+          // Nếu đang chờ ack, kiểm tra lại xem đã đủ chưa với số mới
+          if(game.waitingForAcks){
+            console.log(`[SYNC] ${roomId} - After join, waiting ${game.clientAcks.size}/${game.expectedAcks} acks`);
+          }
+        }
+        
+        // Gửi trạng thái game hiện tại cho người mới vào
+        if(game.drawn && game.drawn.length > 0){
+          socket.emit('game-state-sync', {
+            roomId,
+            drawn: [...game.drawn],
+            currentDrawIndex: game.currentDrawIndex,
+            expectedAcks: game.expectedAcks,
+            totalPlayers: realPlayersNow.length,
+            isPlaying: game.isDrawing,
+            waitingForAcks: game.waitingForAcks,
+            gotAcks: game.clientAcks.size
+          });
+          console.log(`[MID-GAME JOIN] ${roomId} - Sent game state to new player ${joinedUsername}: ${game.drawn.length} numbers drawn, waiting ${game.clientAcks.size}/${game.expectedAcks}`);
+        }
+      }
+    }catch(e){
+      console.log('mid-game join sync error', e.message);
+    }
   });
 
   socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor, isDemo})=>{

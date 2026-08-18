@@ -565,25 +565,39 @@ io.on('connection', (socket)=>{
         for(const p of players){
           if(checkWin(p.ticket, drawnSet)){
             clearInterval(interval);
+            const game = activeGames.get(roomId);
             activeGames.delete(roomId);
             const bet = roomData.bet_amount;
             const feePercent = roomData.fee_percent;
-            const totalPot = players.length * bet;
+            // Pot includes original players + forfeited (those who left during game)
+            const originalCount = game && game.originalPlayers ? game.originalPlayers.length : players.length;
+            const forfeitedCount = game && game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
+            const totalPlayersForPot = Math.max(players.length + forfeitedCount, originalCount);
+            const totalPot = totalPlayersForPot * bet;
             const fee = Math.floor(totalPot * feePercent / 100);
             const winAmount = totalPot - fee;
+            
+            // Deduct from losers who are still in room and haven't been forfeited yet
             for(const pl of players){
               if(pl.user_id && pl.id !== p.id){
+                // Skip if already forfeited (already deducted when they left)
+                const alreadyForfeited = game && game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                if(alreadyForfeited) continue;
                 const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
-                if(prof) await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
+                if(prof) {
+                  await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
+                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose', amount: -bet, room_id: roomId}]);
+                }
               }
-              if(pl.user_id === p.user_id){
-                const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
-                if(prof) await supabase.from('profiles').update({balance: prof.balance + winAmount}).eq('id',pl.user_id);
-              }
+            }
+            // Winner gets pot (forfeited players already deducted)
+            if(p.user_id){
+              const {data: prof} = await supabase.from('profiles').select('balance').eq('id',p.user_id).single();
+              if(prof) await supabase.from('profiles').update({balance: prof.balance + winAmount}).eq('id',p.user_id);
             }
             await supabase.from('transactions').insert([{user_id: p.user_id, type:'win', amount: winAmount, room_id:roomId}]);
             await supabase.from('rooms').update({status:'finished', winner_id: p.user_id || null}).eq('id',roomId);
-            io.to(roomId).emit('game-won', {winner: p, number: num, winAmount, fee, totalPot, reason:'bingo'});
+            io.to(roomId).emit('game-won', {winner: p, number: num, winAmount, fee, totalPot, reason:'bingo', forfeitedAmount: game ? (game.forfeitedAmount || 0) : 0, forfeitedCount});
             break;
           }
         }
@@ -632,15 +646,57 @@ io.on('connection', (socket)=>{
         leavingUsername = await getUsernameById(leavingUserId);
       }
       if(leavingRoomId && leavingUserId){
+        // Check game state BEFORE deleting player
+        const game = activeGames.get(leavingRoomId);
+        const isPlaying = game && game.roomData && (game.roomData.status === 'playing' || game.roomData.status === 'counting');
+        const betAmount = game ? game.roomData.bet_amount : null;
+        
+        // ===== NEW LOGIC: Tự động trừ tiền nếu rời phòng khi đang quay =====
+        if(isPlaying && betAmount){
+          // Init tracking for forfeited players
+          if(!game.forfeitedPlayers) game.forfeitedPlayers = [];
+          if(!game.forfeitedAmount) game.forfeitedAmount = 0;
+          
+          // Check if already forfeited
+          const alreadyForfeited = game.forfeitedPlayers.some(p => p.user_id === leavingUserId);
+          if(!alreadyForfeited){
+            console.log(`Player ${leavingUserId} left during game ${leavingRoomId}, deducting ${betAmount} and adding to pot`);
+            
+            // Deduct from leaver balance
+            try{
+              const {data: prof} = await supabase.from('profiles').select('balance').eq('id', leavingUserId).single();
+              if(prof && prof.balance >= betAmount){
+                await supabase.from('profiles').update({balance: prof.balance - betAmount}).eq('id', leavingUserId);
+                await supabase.from('transactions').insert([{user_id: leavingUserId, type:'forfeit', amount: -betAmount, room_id: leavingRoomId, description: `Rời phòng khi đang quay - mất cược ${betAmount}` }]);
+                
+                // Add to forfeited tracking
+                game.forfeitedPlayers.push({user_id: leavingUserId, username: leavingUsername, bet: betAmount});
+                game.forfeitedAmount += betAmount;
+                
+                // Update total pot for remaining players display
+                const currentPot = (game.originalPlayers ? game.originalPlayers.length : game.players.length) * betAmount;
+                const newTotalPot = currentPot; // Pot stays same, but winner will get more because leaver's bet is forfeited
+                io.to(leavingRoomId).emit('player-forfeited', {
+                  userId: leavingUserId, 
+                  username: leavingUsername || 'Người chơi',
+                  forfeitedAmount: betAmount,
+                  totalForfeited: game.forfeitedAmount,
+                  message: `${leavingUsername || 'Người chơi'} đã rời phòng khi đang quay, mất ${betAmount.toLocaleString()} xu vào pot!`
+                });
+                io.to(leavingRoomId).emit('toast', {message: `${leavingUsername || 'Người chơi'} rời phòng khi đang quay, ${betAmount.toLocaleString()} xu của họ sẽ cộng cho người thắng!`, type:'warning'});
+              }
+            }catch(e){ console.log('forfeit deduct error', e.message); }
+          }
+        }
+        
         // Xoa khoi room_players
         await supabase.from('room_players').delete().eq('room_id', leavingRoomId).eq('user_id', leavingUserId);
         // Thong bao cho phong
-        io.to(leavingRoomId).emit('player-left', {userId: leavingUserId, username: leavingUsername || 'Người chơi', roomId: leavingRoomId});
+        io.to(leavingRoomId).emit('player-left', {userId: leavingUserId, username: leavingUsername || 'Người chơi', roomId: leavingRoomId, wasPlaying: !!isPlaying, forfeited: isPlaying ? betAmount : 0});
         const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', leavingRoomId);
         io.to(leavingRoomId).emit('players-update', remainingPlayers);
 
         // Kiem tra neu dang choi ma chi con 1 nguoi -> auto win
-        const game = activeGames.get(leavingRoomId);
         if(game && game.players){
           const stillInRoom = remainingPlayers.filter(p=>!p.is_bot);
           // Chi con 1 nguoi that
@@ -650,19 +706,21 @@ io.on('connection', (socket)=>{
             activeGames.delete(leavingRoomId);
             const bet = game.roomData.bet_amount;
             const feePercent = game.roomData.fee_percent;
-            const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + 1);
+            const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + 1 + (game.forfeitedPlayers ? game.forfeitedPlayers.length : 0));
             const totalPot = originalCount * bet;
             const fee = Math.floor(totalPot * feePercent / 100);
             const winAmount = totalPot - fee;
             const winner = stillInRoom[0];
-            // Tru tien nguoi out (da out roi nhung van tru de cong vao pot)
-            // Trong truong hop nay, nguoi out da bi xoa khoi room_players, nhung ta van tru balance cua ho dua tren originalPlayers
+            // Tru tien nguoi out (da out roi nhung van tru de cong vao pot) - skip those already forfeited
             for(const pl of game.originalPlayers){
               if(pl.user_id && pl.user_id !== winner.user_id){
-                const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
-                if(prof){
-                  // Chi tru neu chua tru
-                  await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
+                const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                if(!alreadyDeducted){
+                  const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
+                  if(prof){
+                    await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit', amount: -bet, room_id: leavingRoomId}]);
+                  }
                 }
               }
             }
@@ -672,8 +730,13 @@ io.on('connection', (socket)=>{
             }
             await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win', amount: winAmount, room_id:leavingRoomId}]);
             await supabase.from('rooms').update({status:'finished', winner_id: winner.user_id}).eq('id',leavingRoomId);
-            io.to(leavingRoomId).emit('game-won', {winner: winner, winAmount, fee, totalPot, reason:'last_man_standing', leftCount: originalCount -1});
-            io.to(leavingRoomId).emit('toast', {message: `Người chơi cuối cùng ${winner.username || 'Bạn'} thắng vì mọi người đã rời phòng!`, type:'success'});
+            io.to(leavingRoomId).emit('game-won', {winner: winner, winAmount, fee, totalPot, reason:'last_man_standing', leftCount: originalCount -1, forfeitedAmount: game.forfeitedAmount || 0});
+            io.to(leavingRoomId).emit('toast', {message: `Người chơi cuối cùng ${winner.username || 'Bạn'} thắng ${winAmount.toLocaleString()} xu vì mọi người đã rời phòng!`, type:'success'});
+          } else if(isPlaying && stillInRoom.length > 1){
+            // Still more than 1 player, but someone left during playing - update pot info
+            const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + (game.forfeitedPlayers ? game.forfeitedPlayers.length : 0) + 1);
+            const totalPot = originalCount * betAmount;
+            io.to(leavingRoomId).emit('pot-updated', {totalPot, forfeitedAmount: game.forfeitedAmount || 0, remainingCount: stillInRoom.length});
           }
         }
       }
@@ -685,13 +748,35 @@ io.on('connection', (socket)=>{
       const userId = socket.data.userId;
       const roomId = socket.data.roomId;
       if(userId && roomId){
-        // Xu ly nhu leave-room
+        const game = activeGames.get(roomId);
+        const isPlaying = game && game.roomData && (game.roomData.status === 'playing' || game.roomData.status === 'counting');
+        const betAmount = game ? game.roomData.bet_amount : null;
+        
+        // Same forfeit logic as leave-room
+        if(isPlaying && betAmount){
+          if(!game.forfeitedPlayers) game.forfeitedPlayers = [];
+          if(!game.forfeitedAmount) game.forfeitedAmount = 0;
+          const alreadyForfeited = game.forfeitedPlayers.some(p => p.user_id === userId);
+          if(!alreadyForfeited){
+            try{
+              const {data: prof} = await supabase.from('profiles').select('balance').eq('id', userId).single();
+              if(prof && prof.balance >= betAmount){
+                await supabase.from('profiles').update({balance: prof.balance - betAmount}).eq('id', userId);
+                await supabase.from('transactions').insert([{user_id: userId, type:'forfeit', amount: -betAmount, room_id: roomId, description: `Mất kết nối khi đang quay - mất cược`}]);
+                const username = await getUsernameById(userId);
+                game.forfeitedPlayers.push({user_id: userId, username: username, bet: betAmount});
+                game.forfeitedAmount += betAmount;
+                io.to(roomId).emit('player-forfeited', {userId, username: username || 'Người chơi', forfeitedAmount: betAmount, totalForfeited: game.forfeitedAmount});
+              }
+            }catch(e){ console.log('disconnect forfeit error', e.message); }
+          }
+        }
+        
         const username = await getUsernameById(userId);
         await supabase.from('room_players').delete().eq('room_id', roomId).eq('user_id', userId);
-        io.to(roomId).emit('player-left', {userId, username: username || 'Người chơi', roomId});
+        io.to(roomId).emit('player-left', {userId, username: username || 'Người chơi', roomId, wasPlaying: !!isPlaying});
         const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
         io.to(roomId).emit('players-update', remainingPlayers);
-        const game = activeGames.get(roomId);
         if(game){
           const stillInRoom = remainingPlayers.filter(p=>!p.is_bot);
           if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){
@@ -699,22 +784,28 @@ io.on('connection', (socket)=>{
             activeGames.delete(roomId);
             const bet = game.roomData.bet_amount;
             const feePercent = game.roomData.fee_percent;
-            const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + 1);
+            const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + 1 + (game.forfeitedPlayers ? game.forfeitedPlayers.length : 0));
             const totalPot = originalCount * bet;
             const fee = Math.floor(totalPot * feePercent / 100);
             const winAmount = totalPot - fee;
             const winner = stillInRoom[0];
             for(const pl of game.originalPlayers){
               if(pl.user_id && pl.user_id !== winner.user_id){
-                const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
-                if(prof) await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
+                const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                if(!alreadyDeducted){
+                  const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
+                  if(prof) {
+                    await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit', amount: -bet, room_id: roomId}]);
+                  }
+                }
               }
             }
             const {data: winnerProf} = await supabase.from('profiles').select('balance').eq('id',winner.user_id).single();
             if(winnerProf) await supabase.from('profiles').update({balance: winnerProf.balance + winAmount}).eq('id',winner.user_id);
             await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win', amount: winAmount, room_id:roomId}]);
             await supabase.from('rooms').update({status:'finished', winner_id: winner.user_id}).eq('id',roomId);
-            io.to(roomId).emit('game-won', {winner, winAmount, fee, totalPot, reason:'last_man_standing'});
+            io.to(roomId).emit('game-won', {winner, winAmount, fee, totalPot, reason:'last_man_standing', forfeitedAmount: game.forfeitedAmount || 0});
           }
         }
       }

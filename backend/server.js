@@ -18,6 +18,13 @@ app.use(cors({ origin: "*" }));
 app.use(express.json());
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
+const DEPOSIT_BANK_INFO = {
+  bank: 'BIDV',
+  account: '96247DV7M8',
+  holder: 'VU TRUNG THANH'
+};
+const DEPOSIT_BANK = DEPOSIT_BANK_INFO;
+
 const APPSCRIPT_URL = process.env.APPSCRIPT_URL;
 
 // Helper lay username tu profiles

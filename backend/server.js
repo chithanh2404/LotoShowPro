@@ -833,7 +833,7 @@ app.get('/api/rooms', async (req,res)=>{
         playerCount: realPlayers.length,
         realPlayersCount: realPlayers.length,
         totalPlayers: totalPlayers,
-        maxPlayers: room.max_players || 10,
+        maxPlayers: 10, // ép tất cả phòng lên 10 người
         bet_amount: room.bet_amount || room.bet || 0,
         fee: room.fee_percent || room.fee || 20,
         status: room.status || 'waiting',
@@ -902,7 +902,7 @@ io.on('connection', (socket)=>{
     const {data: existList} = await supabase.from('room_players').select('*').eq('room_id',roomId).eq('user_id',userId);
     // Kiểm tra giới hạn phòng - đã tăng từ 5 lên 10
     const {data: allPlayersCheck} = await supabase.from('room_players').select('id').eq('room_id',roomId);
-    const maxPlayersAllowed = room.max_players || 10;
+    const maxPlayersAllowed = Math.max(room.max_players || 5, 10); // ép 10
     if((!existList || existList.length===0) && allPlayersCheck && allPlayersCheck.length >= maxPlayersAllowed){
       return socket.emit('error','Phòng đã đầy ('+maxPlayersAllowed+' người)! Vui lòng chọn phòng khác.');
     }

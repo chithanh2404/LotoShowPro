@@ -31,6 +31,13 @@ async function getUsernameById(userId){
   return null;
 }
 
+async function getProfileById(userId){
+  try{
+    const {data: profile} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+    return profile;
+  }catch(e){ return null; }
+}
+
 // ===== UTILS: Tạo vé Loto chuẩn Việt Nam =====
 function generateLotoTicket() {
   const ticket = Array(3).fill(0).map(()=> Array(9).fill(null));
@@ -91,15 +98,8 @@ function checkWin(ticket, drawnSet){
   return false;
 }
 
-// ===== AUDIO VARIANTS - dong bo nhac cho tat ca thiet bi =====
-// So luong bien the bai hat cho moi so (tuong ung audioVariants ben frontend)
-// De dong bo, server se tinh variant dua tren so + thu tu quay, khong random rieng
 function getAudioVariantForNumber(num, drawIndex, roomId){
-  // Deterministic: dung hash don gian de tat ca client phat cung 1 ban nhac
-  // Vi du: co 2-3 bien the cho moi so, ta chon dua tren drawIndex + num
-  // Gia su moi so co toi da 3 bien the
-  const maxVariants = 3; // neu so nao chi co 1 file thi client se fallback ve 0
-  // Hash: (num * 7 + drawIndex * 13 + roomId char code sum) % maxVariants
+  const maxVariants = 3;
   let roomHash = 0;
   if(roomId){
     for(let i=0;i<roomId.length;i++) roomHash += roomId.charCodeAt(i);
@@ -178,226 +178,273 @@ app.get('/api/auth/confirm-all', async (req,res)=>{
   }catch(e){ res.status(500).json({ok:false, error:e.message}); }
 });
 
-
-// ===== DEPOSIT SYSTEM - BIDV SEPAY AUTO - 96247DV7M8 - VU TRUNG THANH =====
-const DEPOSIT_BANK_INFO = {
-  bank: 'BIDV',
-  account: '96247DV7M8',
-  holder: 'VU TRUNG THANH',
-  template: 'compact'
-};
-
-// Helper tao noi dung chuyen khoan duy nhat
-function generateTransferContent(userId){
-  // NAP + 4 ky tu cuoi userId + 4 ky tu random
-  const shortId = userId ? userId.toString().slice(-4).toUpperCase() : 'XXXX';
-  const random = nanoid(4).toUpperCase();
-  return `NAP${shortId}${random}`;
-}
-
-// API: Tao lenh nap tien
-app.post('/api/deposit/create', async (req, res) => {
+// ===== NEW: Profile APIs =====
+app.get('/api/profile/:userId', async (req,res)=>{
   try{
-    const { userId, amount } = req.body;
-    if(!userId) return res.status(400).json({error: 'Thieu userId'});
-    const amt = parseInt(amount);
-    if(!amt || amt < 10000) return res.status(400).json({error: 'So tien toi thieu 10,000 VND'});
-    if(amt > 50000000) return res.status(400).json({error: 'So tien toi da 50,000,000 VND'});
+    const {userId} = req.params;
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({error:'Profile not found'});
+    // Ensure demo_balance exists
+    const demo_balance = profile.demo_balance !== undefined ? profile.demo_balance : 100000;
+    const balance = profile.balance || 0;
+    const total_deposited = profile.total_deposited || 0;
+    const total_wagered = profile.total_wagered || 0;
+    const role = profile.role || 'user';
+    res.json({...profile, demo_balance, balance, total_deposited, total_wagered, role, total_balance: balance + demo_balance});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 
-    const transferContent = generateTransferContent(userId);
-    const depositId = 'DEP-' + nanoid(8).toUpperCase();
+app.post('/api/profile/bank', async (req,res)=>{
+  try{
+    const {userId, bank_name, bank_account, account_holder} = req.body;
+    if(!userId) return res.status(400).json({error:'Missing userId'});
+    if(!bank_name || !bank_account || !account_holder) return res.status(400).json({error:'Thiếu thông tin ngân hàng'});
+    const {data, error} = await supabase.from('profiles').update({bank_name, bank_account, account_holder, bank_updated_at: new Date().toISOString()}).eq('id', userId).select().single();
+    if(error) return res.status(500).json({error:error.message});
+    res.json({ok:true, profile:data});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/profile/change-password', async (req,res)=>{
+  try{
+    const {userId, newPassword} = req.body;
+    if(!userId || !newPassword) return res.status(400).json({error:'Missing params'});
+    if(newPassword.length < 6) return res.status(400).json({error:'Mật khẩu phải >=6 ký tự'});
+    const {error} = await supabase.auth.admin.updateUserById(userId, {password: newPassword});
+    if(error) return res.status(500).json({error:error.message});
+    res.json({ok:true, message:'Đổi mật khẩu thành công'});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ===== NEW: Withdrawal APIs =====
+app.post('/api/withdrawals/request', async (req,res)=>{
+  try{
+    const {userId, amount, bank_name, bank_account, account_holder} = req.body;
+    if(!userId || !amount) return res.status(400).json({error:'Thiếu thông tin'});
+    const amt = parseInt(amount);
+    if(amt < 50000) return res.status(400).json({error:'Số tiền rút tối thiểu 50,000 xu'});
     
-    // Luu vao DB - bang deposits
-    const { data, error } = await supabase.from('deposits').insert({
-      id: depositId,
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({error:'User not found'});
+    if(profile.is_banned) return res.status(403).json({error:'Tài khoản bị khóa, không thể rút tiền'});
+    
+    const realBalance = profile.balance || 0;
+    const totalDeposited = profile.total_deposited || 0;
+    const totalWagered = profile.total_wagered || 0;
+    
+    if(realBalance < amt) return res.status(400).json({error:`Số dư thật không đủ. Bạn có ${realBalance.toLocaleString()} xu thật`});
+    
+    // Wager requirement: must wager at least total_deposited
+    if(totalDeposited > 0 && totalWagered < totalDeposited){
+      const need = totalDeposited - totalWagered;
+      return res.status(400).json({error:`Bạn cần cược thêm ${need.toLocaleString()} xu nữa mới được rút. Đã cược ${totalWagered.toLocaleString()}/${totalDeposited.toLocaleString()}`, need, totalWagered, totalDeposited});
+    }
+    
+    // Use provided bank or profile bank
+    const finalBankName = bank_name || profile.bank_name;
+    const finalBankAccount = bank_account || profile.bank_account;
+    const finalAccountHolder = account_holder || profile.account_holder;
+    
+    if(!finalBankName || !finalBankAccount || !finalAccountHolder){
+      return res.status(400).json({error:'Vui lòng cập nhật thông tin ngân hàng trước khi rút'});
+    }
+    
+    // Create withdrawal
+    const {data, error} = await supabase.from('withdrawals').insert({
       user_id: userId,
       amount: amt,
-      transfer_content: transferContent,
-      transfer_content_lower: transferContent.toLowerCase(),
-      status: 'pending',
-      bank: DEPOSIT_BANK_INFO.bank,
-      account_number: DEPOSIT_BANK_INFO.account,
-      account_holder: DEPOSIT_BANK_INFO.holder
+      bank_name: finalBankName,
+      bank_account: finalBankAccount,
+      account_holder: finalAccountHolder,
+      status: 'pending'
     }).select().single();
-
-    if(error){
-      console.log('Deposit create error:', error.message);
-      // Neu bang chua ton tai, thu tao bang tam thoi bang cach return truc tiep
-      // Van tra ve thong tin de frontend hien thi
-      return res.json({
-        id: depositId,
-        userId,
-        amount: amt,
-        transferContent,
-        bank: DEPOSIT_BANK_INFO.bank,
-        account: DEPOSIT_BANK_INFO.account,
-        holder: DEPOSIT_BANK_INFO.holder,
-        qrUrl: `https://qr.sepay.vn/img?bank=BIDV&acc=${DEPOSIT_BANK_INFO.account}&template=compact&amount=${amt}&des=${encodeURIComponent(transferContent)}`,
-        vietQrUrl: `https://img.vietqr.io/image/BIDV-${DEPOSIT_BANK_INFO.account}-qr_only.png?amount=${amt}&addInfo=${encodeURIComponent(transferContent)}&accountName=${encodeURIComponent(DEPOSIT_BANK_INFO.holder)}`,
-        status: 'pending',
-        note: 'Bang deposits chua ton tai, vui long chay SQL tao bang'
-      });
-    }
-
-    res.json({
-      id: data.id,
-      userId,
-      amount: data.amount,
-      transferContent: data.transfer_content,
-      bank: data.bank,
-      account: data.account_number,
-      holder: data.account_holder,
-      qrUrl: `https://qr.sepay.vn/img?bank=BIDV&acc=${DEPOSIT_BANK_INFO.account}&template=compact&amount=${amt}&des=${encodeURIComponent(transferContent)}`,
-      vietQrUrl: `https://img.vietqr.io/image/BIDV-${DEPOSIT_BANK_INFO.account}-qr_only.png?amount=${amt}&addInfo=${encodeURIComponent(transferContent)}&accountName=${encodeURIComponent(DEPOSIT_BANK_INFO.holder)}`,
-      status: data.status,
-      created_at: data.created_at
-    });
-  }catch(e){
-    console.error('Deposit create error:', e);
-    res.status(500).json({error: e.message});
-  }
-});
-
-// API: Kiem tra trang thai lenh nap
-app.get('/api/deposit/status/:id', async (req, res) => {
-  try{
-    const { id } = req.params;
-    const { data, error } = await supabase.from('deposits').select('*').eq('id', id).single();
-    if(error || !data) return res.status(404).json({error: 'Khong tim thay lenh nap'});
-    res.json(data);
-  }catch(e){ res.status(500).json({error: e.message}); }
-});
-
-// API: Lich su nap tien
-app.get('/api/deposit/history', async (req, res) => {
-  try{
-    const userId = req.query.userId;
-    if(!userId) return res.status(400).json({error: 'Thieu userId'});
-    const { data, error } = await supabase.from('deposits').select('*').eq('user_id', userId).order('created_at', {ascending: false}).limit(20);
-    if(error) return res.json([]);
-    res.json(data);
-  }catch(e){ res.status(500).json({error: e.message}); }
-});
-
-// API: Lay so du user
-app.get('/api/user/balance', async (req, res) => {
-  try{
-    const userId = req.query.userId;
-    if(!userId) return res.status(400).json({error: 'Thieu userId'});
-    const { data, error } = await supabase.from('profiles').select('balance').eq('id', userId).single();
-    if(error) return res.status(404).json({error: 'User not found'});
-    res.json({ balance: data.balance || 0 });
-  }catch(e){ res.status(500).json({error: e.message}); }
-});
-
-// API: Webhook Sepay - Tu dong duyet khi chuyen khoan thanh cong
-// Sepay se gui POST den https://lotoshowpro.onrender.com/api/sepay/webhook
-// Cau hinh trong Sepay dashboard: Webhook URL = https://lotoshowpro.onrender.com/api/sepay/webhook
-app.post('/api/sepay/webhook', async (req, res) => {
-  try{
-    const payload = req.body;
-    console.log('Sepay webhook received:', JSON.stringify(payload).slice(0, 1000));
-
-    // Sepay co the gui 1 object hoac array, hoac co wrapper { data: {...} }
-    let transaction = payload;
-    if(payload.data) transaction = payload.data;
-    if(Array.isArray(transaction)) transaction = transaction[0];
-
-    // Lay thong tin giao dich
-    const content = (transaction.content || transaction.description || transaction.transferContent || '').toString();
-    const amount = parseInt(transaction.transferAmount || transaction.amount || transaction.transfer_amount || 0);
-    const accountNumber = (transaction.accountNumber || transaction.account_number || '').toString();
-    const transactionId = (transaction.id || transaction.referenceCode || transaction.reference_code || '').toString();
-    const gateway = (transaction.gateway || transaction.bank || '').toString();
-
-    if(!content || !amount){
-      console.log('Webhook missing content or amount');
-      return res.json({ success: false, message: 'Missing content or amount' });
-    }
-
-    // Chi xu ly giao dich vao (in) va dung tai khoan BIDV cua chung ta
-    // Neu co nhieu tai khoan, kiem tra accountNumber
-    if(accountNumber && accountNumber !== DEPOSIT_BANK_INFO.account && !accountNumber.includes(DEPOSIT_BANK_INFO.account)){
-      console.log('Webhook account mismatch:', accountNumber);
-      // Van tiep tuc xu ly neu content khop, de tranh truong hop Sepay gui accountNumber khac format
-    }
-
-    // Tim lenh nap dang pending co transfer_content nam trong content chuyen khoan
-    // Vi du: content = "NAPABCD1234 chuyen tien" -> tim NAPABCD1234
-    const contentLower = content.toLowerCase();
     
-    // Lay tat ca lenh pending
-    const { data: pendingDeposits, error } = await supabase.from('deposits').select('*').eq('status', 'pending').order('created_at', {ascending: false}).limit(50);
+    if(error) return res.status(500).json({error:error.message});
     
-    if(error){
-      console.log('Fetch pending deposits error:', error.message);
-      return res.status(500).json({ success: false, error: error.message });
-    }
+    res.json({ok:true, withdrawal:data, message:'Đã tạo lệnh rút tiền, vui lòng chờ admin duyệt'});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
 
+app.get('/api/withdrawals/my/:userId', async (req,res)=>{
+  try{
+    const {userId} = req.params;
+    const {data, error} = await supabase.from('withdrawals').select('*').eq('user_id', userId).order('created_at', {ascending:false});
+    if(error) return res.status(500).json({error:error.message});
+    res.json(data || []);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.get('/api/withdrawals/all', async (req,res)=>{
+  try{
+    const {userId} = req.query;
+    if(!userId) return res.status(400).json({error:'Missing userId'});
+    const profile = await getProfileById(userId);
+    if(!profile || profile.role !== 'admin') return res.status(403).json({error:'Không có quyền admin'});
+    
+    const {data, error} = await supabase.from('withdrawals').select('*, profiles(username, email)').order('created_at', {ascending:false});
+    if(error) return res.status(500).json({error:error.message});
+    res.json(data || []);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ===== NEW: Admin APIs =====
+function isAdmin(profile){
+  return profile && profile.role === 'admin';
+}
+
+app.get('/api/admin/users', async (req,res)=>{
+  try{
+    const {adminId} = req.query;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    const {data, error} = await supabase.from('profiles').select('*').order('created_at', {ascending:false}).limit(100);
+    if(error) return res.status(500).json({error:error.message});
+    res.json(data || []);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.get('/api/admin/withdrawals', async (req,res)=>{
+  try{
+    const {adminId, status} = req.query;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    let query = supabase.from('withdrawals').select('*, profiles!inner(username, email, balance, demo_balance)').order('created_at', {ascending:false});
+    if(status) query = query.eq('status', status);
+    const {data, error} = await query;
+    if(error) return res.status(500).json({error:error.message});
+    res.json(data || []);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/admin/withdrawals/:id/approve', async (req,res)=>{
+  try{
+    const {id} = req.params;
+    const {adminId, note} = req.body;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    const {data: wd} = await supabase.from('withdrawals').select('*, profiles!inner(balance)').eq('id', id).single();
+    if(!wd) return res.status(404).json({error:'Withdrawal not found'});
+    if(wd.status !== 'pending') return res.status(400).json({error:'Lệnh đã được xử lý'});
+    
+    const profile = await getProfileById(wd.user_id);
+    if(!profile) return res.status(404).json({error:'User not found'});
+    if((profile.balance || 0) < wd.amount) return res.status(400).json({error:'User không đủ số dư thật'});
+    
+    // Deduct real balance
+    const newBalance = (profile.balance || 0) - wd.amount;
+    const newTotalWithdrawn = (profile.total_withdrawn || 0) + wd.amount;
+    await supabase.from('profiles').update({balance: newBalance, total_withdrawn: newTotalWithdrawn}).eq('id', wd.user_id);
+    
+    // Update withdrawal
+    const {data, error} = await supabase.from('withdrawals').update({status:'approved', processed_at: new Date().toISOString(), admin_id: adminId, admin_note: note || 'Đã duyệt'}).eq('id', id).select().single();
+    if(error) return res.status(500).json({error:error.message});
+    
+    await supabase.from('transactions').insert([{user_id: wd.user_id, type:'withdraw', amount: -wd.amount, description: `Rút tiền ${wd.amount} về ${wd.bank_name} ${wd.bank_account}`}]);
+    
+    res.json({ok:true, withdrawal:data});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/admin/withdrawals/:id/reject', async (req,res)=>{
+  try{
+    const {id} = req.params;
+    const {adminId, note} = req.body;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    const {data, error} = await supabase.from('withdrawals').update({status:'rejected', processed_at: new Date().toISOString(), admin_id: adminId, admin_note: note || 'Bị từ chối'}).eq('id', id).select().single();
+    if(error) return res.status(500).json({error:error.message});
+    res.json({ok:true, withdrawal:data});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/admin/users/:id/ban', async (req,res)=>{
+  try{
+    const {id} = req.params;
+    const {adminId, reason} = req.body;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    const {data, error} = await supabase.from('profiles').update({is_banned:true, banned_reason: reason || 'Vi phạm', banned_at: new Date().toISOString(), banned_by: adminId}).eq('id', id).select().single();
+    if(error) return res.status(500).json({error:error.message});
+    res.json({ok:true, user:data});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/admin/users/:id/unban', async (req,res)=>{
+  try{
+    const {id} = req.params;
+    const {adminId} = req.body;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    const {data, error} = await supabase.from('profiles').update({is_banned:false, banned_reason:null, banned_at:null}).eq('id', id).select().single();
+    if(error) return res.status(500).json({error:error.message});
+    res.json({ok:true, user:data});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.get('/api/admin/stats', async (req,res)=>{
+  try{
+    const {adminId} = req.query;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    // Top winners (by total win amount from transactions)
+    const {data: winStats} = await supabase.from('transactions').select('user_id, amount, profiles(username)').eq('type','win').order('amount', {ascending:false}).limit(20);
+    const {data: loseStats} = await supabase.from('transactions').select('user_id, amount, profiles(username)').eq('type','lose').order('amount', {ascending:true}).limit(20);
+    
+    // Users with most withdrawals
+    const {data: withdrawStats} = await supabase.from('withdrawals').select('user_id, amount, profiles(username)').eq('status','approved').order('amount', {ascending:false}).limit(20);
+    
+    res.json({topWinners: winStats || [], topLosers: loseStats || [], topWithdrawals: withdrawStats || []});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.get('/api/admin/transactions/:userId', async (req,res)=>{
+  try{
+    const {userId} = req.params;
+    const {adminId} = req.query;
+    const adminProfile = await getProfileById(adminId);
+    if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
+    
+    const {data, error} = await supabase.from('transactions').select('*').eq('user_id', userId).order('created_at', {ascending:false}).limit(50);
+    if(error) return res.status(500).json({error:error.message});
+    res.json(data || []);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+// ===== Existing APIs: Deposit, Rooms, etc =====
+app.post('/api/deposit/webhook', async (req,res)=>{
+  try{
+    const {transferContent, amount, bankAccount} = req.body;
+    const content = transferContent || req.body.content || '';
+    const amt = parseInt(amount || req.body.transferAmount || 0);
+    if(!content) return res.status(400).json({error:'Missing content'});
+    
+    const {data: pendingDeposits} = await supabase.from('deposits').select('*').eq('status','pending').order('created_at', {ascending:false});
     let matchedDeposit = null;
     for(const dep of pendingDeposits || []){
-      const transferContentLower = (dep.transfer_content_lower || dep.transfer_content || '').toLowerCase();
-      if(transferContentLower && contentLower.includes(transferContentLower)){
-        matchedDeposit = dep;
-        break;
-      }
-      // Thu tim theo id ngan gon neu content co chua id
-      if(dep.id && contentLower.includes(dep.id.toLowerCase().slice(-6))){
+      if(content.includes(dep.transfer_content)){
         matchedDeposit = dep;
         break;
       }
     }
-
-    // Neu khong tim thay theo content, thu parse content kieu NAPxxxx
     if(!matchedDeposit){
-      const napMatch = content.match(/NAP[A-Z0-9]{4,12}/i);
-      if(napMatch){
-        const code = napMatch[0];
-        const { data: depByCode } = await supabase.from('deposits').select('*').ilike('transfer_content', `%${code}%`).eq('status', 'pending').maybeSingle();
-        if(depByCode) matchedDeposit = depByCode;
-      }
+      return res.status(404).json({error:'Deposit not found for content '+content});
     }
-
-    if(!matchedDeposit){
-      console.log('No matching deposit found for content:', content);
-      return res.json({ success: true, message: 'No matching deposit, but webhook received', content, amount });
-    }
-
-    // Kiem tra so tien - cho phep chenh lech nho (do phi) hoac phai bang hoac lon hon
-    if(amount < matchedDeposit.amount){
-      console.log(`Amount mismatch: received ${amount} < expected ${matchedDeposit.amount} for ${matchedDeposit.id}`);
-      // Van co the chap nhan neu amount >= 90% expected? Tam thoi yeu cau dung so tien
-      // return res.json({ success: false, message: `Amount ${amount} less than expected ${matchedDeposit.amount}` });
-    }
-
-    // Cong tien cho user
-    const { data: profile } = await supabase.from('profiles').select('balance').eq('id', matchedDeposit.user_id).single();
-    const currentBalance = profile ? (profile.balance || 0) : 0;
-    const newBalance = currentBalance + matchedDeposit.amount;
-
-    await supabase.from('profiles').update({ balance: newBalance }).eq('id', matchedDeposit.user_id);
-
-    // Cap nhat trang thai deposit
-    await supabase.from('deposits').update({
-      status: 'success',
-      sepay_transaction_id: transactionId,
-      sepay_data: transaction,
-      confirmed_at: new Date().toISOString(),
-      received_amount: amount,
-      received_content: content
-    }).eq('id', matchedDeposit.id);
-
-    // Ghi transaction
-    await supabase.from('transactions').insert([{
-      user_id: matchedDeposit.user_id,
-      type: 'deposit',
-      amount: matchedDeposit.amount,
-      room_id: null,
-      description: `Nap tien ${matchedDeposit.amount} VND - ${matchedDeposit.transfer_content} - Sepay ${transactionId}`
-    }]);
-
-    console.log(`Deposit success: ${matchedDeposit.id} for user ${matchedDeposit.user_id} +${matchedDeposit.amount} - new balance ${newBalance}`);
-
+    
+    const {data: profile} = await supabase.from('profiles').select('balance, total_deposited').eq('id', matchedDeposit.user_id).single();
+    const newBalance = (profile.balance || 0) + matchedDeposit.amount;
+    const newTotalDeposited = (profile.total_deposited || 0) + matchedDeposit.amount;
+    
+    await supabase.from('profiles').update({balance: newBalance, total_deposited: newTotalDeposited}).eq('id', matchedDeposit.user_id);
+    await supabase.from('deposits').update({status:'success', confirmed_at: new Date().toISOString()}).eq('id', matchedDeposit.id);
+    await supabase.from('transactions').insert([{user_id: matchedDeposit.user_id, type:'deposit', amount: matchedDeposit.amount, description: `Nạp tiền ${matchedDeposit.amount} VND`}]);
+    
     res.json({ success: true, message: 'Deposit confirmed', depositId: matchedDeposit.id, newBalance });
   }catch(e){
     console.error('Sepay webhook error:', e);
@@ -405,19 +452,18 @@ app.post('/api/sepay/webhook', async (req, res) => {
   }
 });
 
-// API: Test webhook manual (de test)
 app.post('/api/deposit/manual-confirm', async (req, res) => {
   try{
     const { depositId, secret } = req.body;
-    // Simple secret check - ban co the doi
     if(secret !== 'loto123') return res.status(403).json({error: 'Invalid secret'});
     const { data: dep } = await supabase.from('deposits').select('*').eq('id', depositId).single();
     if(!dep) return res.status(404).json({error: 'Deposit not found'});
     if(dep.status === 'success') return res.json({message: 'Already success', deposit: dep});
 
-    const { data: profile } = await supabase.from('profiles').select('balance').eq('id', dep.user_id).single();
+    const { data: profile } = await supabase.from('profiles').select('balance, total_deposited').eq('id', dep.user_id).single();
     const newBalance = (profile.balance || 0) + dep.amount;
-    await supabase.from('profiles').update({ balance: newBalance }).eq('id', dep.user_id);
+    const newTotalDeposited = (profile.total_deposited || 0) + dep.amount;
+    await supabase.from('profiles').update({ balance: newBalance, total_deposited: newTotalDeposited }).eq('id', dep.user_id);
     await supabase.from('deposits').update({ status: 'success', confirmed_at: new Date().toISOString() }).eq('id', dep.id);
     await supabase.from('transactions').insert([{ user_id: dep.user_id, type: 'deposit', amount: dep.amount, description: `Manual confirm ${dep.transfer_content}` }]);
     res.json({ success: true, newBalance, deposit: dep });
@@ -427,7 +473,6 @@ app.post('/api/deposit/manual-confirm', async (req, res) => {
 
 app.get('/api/tickets/generate', (req,res)=>{
   const count = parseInt(req.query.count||'6');
-  // Tao ve kem mau sac ngau nhien
   const colors = ['#00d2ff','#FFD700','#ff007f','#39ff14','#ff6b35','#9c27b0','#00bcd4','#e91e63'];
   const tickets = Array(count).fill(0).map((_,i)=> ({
     ticket: generateLotoTicket(),
@@ -438,7 +483,7 @@ app.get('/api/tickets/generate', (req,res)=>{
 });
 
 app.post('/api/rooms', async (req,res)=>{
-  const {hostId, name, password, betAmount, maxPlayers, ticket} = req.body;
+  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo} = req.body;
   const id = 'LOTO-'+nanoid(6).toUpperCase();
   const fee = 20;
   const {data, error} = await supabase.from('rooms').insert({id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||5, fee_percent:fee, status:'waiting'}).select().single();
@@ -446,11 +491,11 @@ app.post('/api/rooms', async (req,res)=>{
   const finalTicket = ticket || generateLotoTicket();
   const username = await getUsernameById(hostId);
   const ticketColor = req.body.ticketColor || '#00d2ff';
-  await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false});
+  const is_demo = !!isDemo;
+  await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
   res.json(data);
 });
 
-// API lay danh sach ve da duoc chon trong phong - de an di cho nguoi khac
 app.get('/api/rooms/:roomId/taken-tickets', async (req,res)=>{
   const {roomId} = req.params;
   try{
@@ -463,7 +508,6 @@ app.get('/api/rooms/:roomId/taken-tickets', async (req,res)=>{
   }
 });
 
-// API lay thong tin phong chi tiet - kiem tra co bot khong
 app.get('/api/rooms/:roomId', async (req,res)=>{
   const {roomId} = req.params;
   try{
@@ -479,12 +523,12 @@ app.get('/api/rooms/:roomId', async (req,res)=>{
 });
 
 // ===== SOCKET.IO GAME LOOP =====
-const activeGames = new Map(); // roomId -> {drawn, interval, numbers, players, originalPlayers, roomData}
+const activeGames = new Map();
 
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
 
-  socket.on('join-room', async ({roomId, userId, password, ticket, ticketColor})=>{
+  socket.on('join-room', async ({roomId, userId, password, ticket, ticketColor, isDemo})=>{
     const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     if(!room) return socket.emit('error','Phòng không tồn tại');
     if(room.password && room.password!==password) return socket.emit('error','Sai mật khẩu phòng');
@@ -496,7 +540,8 @@ io.on('connection', (socket)=>{
       const finalTicket = ticket || generateLotoTicket();
       const username = await getUsernameById(userId);
       const color = ticketColor || '#'+Math.floor(Math.random()*16777215).toString(16);
-      await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: finalTicket, ticket_color: color, is_bot:false});
+      const is_demo = !!isDemo;
+      await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: finalTicket, ticket_color: color, is_bot:false, is_demo});
     } else if(existList.length>1){
       for(let i=1;i<existList.length;i++){
         await supabase.from('room_players').delete().eq('id', existList[i].id);
@@ -505,22 +550,22 @@ io.on('connection', (socket)=>{
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
     io.to(roomId).emit('room-info', room);
-    // Thong bao co nguoi vao cho chat
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
   });
 
-  socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor})=>{
+  socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor, isDemo})=>{
     const roomId = 'SOLO-'+nanoid(6).toUpperCase();
     const fee = Math.max(5, 20 - (botCount-1)*2);
     await supabase.from('rooms').insert({id:roomId, host_id:userId, bet_amount:betAmount, max_players:botCount+1, fee_percent:fee, status:'waiting', name:`Solo ${botCount} bot`});
     const username = await getUsernameById(userId);
     const color = ticketColor || '#00d2ff';
-    await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: ticket || generateLotoTicket(), ticket_color: color, is_bot:false});
-    const botColors = ['#FFD700','#ff6b35','#9c27b0','#00bcd4','#39ff14'];
+    const is_demo = !!isDemo;
+    await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: ticket || generateLotoTicket(), ticket_color: color, is_bot:false, is_demo});
+    const botColors = ['#ff6b35','#9c27b0','#00bcd4','#e91e63','#4caf50','#ff9800'];
     for(let i=0;i<botCount;i++){
-      await supabase.from('room_players').insert({room_id:roomId, is_bot:true, bot_name:`Bot ${i+1}`, ticket: generateLotoTicket(), ticket_color: botColors[i % botColors.length]});
+      await supabase.from('room_players').insert({room_id:roomId, is_bot:true, bot_name:`Bot ${i+1}`, ticket: generateLotoTicket(), ticket_color: botColors[i % botColors.length], is_demo:false});
     }
     socket.join(roomId);
     socket.data.userId = userId;
@@ -528,8 +573,8 @@ io.on('connection', (socket)=>{
     socket.emit('solo-created', {roomId, fee});
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
+    const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     io.to(roomId).emit('room-info', room);
-    // Thong bao co nguoi vao cho chat
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
@@ -547,7 +592,7 @@ io.on('connection', (socket)=>{
       const drawnSet = new Set();
       const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
       const {data: roomData} = await supabase.from('rooms').select('*').eq('id',roomId).single();
-      activeGames.set(roomId, {drawn, players, originalPlayers: [...players], roomData, allNumbers});
+      activeGames.set(roomId, {drawn, players, originalPlayers: [...players], roomData, allNumbers, forfeitedPlayers:[], forfeitedAmount:0});
       const interval = setInterval(async ()=>{
         if(idx>=90){ clearInterval(interval); activeGames.delete(roomId); return; }
         const num = allNumbers[idx];
@@ -556,48 +601,138 @@ io.on('connection', (socket)=>{
         drawnSet.add(num);
         idx++;
         await supabase.from('rooms').update({current_numbers:drawn}).eq('id',roomId);
-        // Gui kem audioVariant de dong bo nhac cho tat ca thiet bi
         io.to(roomId).emit('number-drawn', {number:num, drawn, audioVariant, drawIndex: drawn.length-1});
-        // Update activeGames
         const game = activeGames.get(roomId);
         if(game){ game.drawn = drawn; }
 
         for(const p of players){
+          if(p.is_bot) continue;
           if(checkWin(p.ticket, drawnSet)){
             clearInterval(interval);
-            const game = activeGames.get(roomId);
+            const g = activeGames.get(roomId);
             activeGames.delete(roomId);
             const bet = roomData.bet_amount;
             const feePercent = roomData.fee_percent;
-            // Pot includes original players + forfeited (those who left during game)
-            const originalCount = game && game.originalPlayers ? game.originalPlayers.length : players.length;
-            const forfeitedCount = game && game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
-            const totalPlayersForPot = Math.max(players.length + forfeitedCount, originalCount);
+            const originalCount = g && g.originalPlayers ? g.originalPlayers.length : players.filter(pl=>!pl.is_bot).length;
+            const forfeitedCount = g && g.forfeitedPlayers ? g.forfeitedPlayers.length : 0;
+            const totalPlayersForPot = Math.max(players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
             const totalPot = totalPlayersForPot * bet;
             const fee = Math.floor(totalPot * feePercent / 100);
             const winAmount = totalPot - fee;
             
-            // Deduct from losers who are still in room and haven't been forfeited yet
-            for(const pl of players){
-              if(pl.user_id && pl.id !== p.id){
-                // Skip if already forfeited (already deducted when they left)
-                const alreadyForfeited = game && game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+            // Process win/loss with demo handling - UPDATED per new spec
+            // If winner is demo, losers only lose demo (if have)
+            const isDemoWinnerEarly = p.is_demo;
+            if(!isDemoWinnerEarly){
+              // Real winner: losers lose according to their own bet type
+              for(const pl of players){
+                if(pl.is_bot) continue;
+                if(pl.id === p.id) continue;
+                const alreadyForfeited = g && g.forfeitedPlayers && g.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
                 if(alreadyForfeited) continue;
-                const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
-                if(prof) {
-                  await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
-                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose', amount: -bet, room_id: roomId}]);
+                const prof = await getProfileById(pl.user_id);
+                if(!prof) continue;
+                const isDemoPlayer = pl.is_demo;
+                if(isDemoPlayer){
+                  const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
+                  await supabase.from('profiles').update({
+                    demo_balance: newDemo,
+                    total_wagered: (prof.total_wagered || 0) + bet
+                  }).eq('id', pl.user_id);
+                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo`}]);
+                } else {
+                  const newBal = (prof.balance || 0) - bet;
+                  await supabase.from('profiles').update({
+                    balance: newBal,
+                    total_wagered: (prof.total_wagered || 0) + bet
+                  }).eq('id', pl.user_id);
+                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose', amount: -bet, room_id:roomId}]);
                 }
               }
             }
-            // Winner gets pot (forfeited players already deducted)
-            if(p.user_id){
-              const {data: prof} = await supabase.from('profiles').select('balance').eq('id',p.user_id).single();
-              if(prof) await supabase.from('profiles').update({balance: prof.balance + winAmount}).eq('id',p.user_id);
+            // For demo winner, loser deduction is handled inside winner block below to ensure only demo is deducted
+            
+            // Winner - UPDATED per new spec: demo win -> losers only lose demo (if have), win goes to demo
+            const winnerProf = await getProfileById(p.user_id);
+            if(winnerProf){
+              const isDemoWinner = p.is_demo;
+              if(isDemoWinner){
+                // NEW LOGIC: Thắng → cộng vào demo_balance (người thua cũng chỉ mất tiền demo (nếu có), tiền thắng demo vẫn vào demo)
+                // So losers only lose demo balance if they have it
+                for(const pl of players){
+                  if(pl.is_bot) continue;
+                  if(pl.id === p.id) continue;
+                  const alreadyForfeited = g && g.forfeitedPlayers && g.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                  if(alreadyForfeited) continue;
+                  const prof = await getProfileById(pl.user_id);
+                  if(!prof) continue;
+                  const demoBal = prof.demo_balance || 0;
+                  if(demoBal > 0){
+                    const deduct = Math.min(demoBal, bet);
+                    const newDemo = Math.max(0, demoBal - deduct);
+                    await supabase.from('profiles').update({
+                      demo_balance: newDemo,
+                      total_wagered: (prof.total_wagered || 0) + deduct
+                    }).eq('id', pl.user_id);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -deduct, room_id:roomId, description: `Thua ${deduct} demo (thua người chơi demo)`}]);
+                  } else {
+                    // No demo to lose - still count wager but no deduction (per spec: chỉ mất demo nếu có)
+                    await supabase.from('profiles').update({
+                      total_wagered: (prof.total_wagered || 0) + bet
+                    }).eq('id', pl.user_id);
+                  }
+                }
+                // Winner gets all winAmount to demo
+                const newDemo = (winnerProf.demo_balance || 0) + winAmount;
+                await supabase.from('profiles').update({
+                  demo_balance: newDemo,
+                  total_wagered: (winnerProf.total_wagered || 0) + bet
+                }).eq('id', p.user_id);
+                await supabase.from('transactions').insert([{user_id: p.user_id, type:'win_demo', amount: winAmount, room_id:roomId, description: `Thắng ${winAmount} demo - người thua chỉ mất demo (nếu có)`}]);
+              } else {
+                // Real winner: if there are demo losers, their loss goes to demo? Per spec: demo loser's money goes to winner's demo? 
+                // Spec says: demo player loses -> deduct demo, but add to winner's demo
+                // To implement: if any loser was demo, that portion goes to winner's demo, rest to real
+                // Simplified: winner gets winAmount to real balance, but we track demo portion separately
+                let demoPortion = 0;
+                let realPortion = winAmount;
+                // Calculate demo portion from forfeited and demo losers
+                if(g && g.forfeitedPlayers){
+                  for(const fp of g.forfeitedPlayers){
+                    const fpPlayer = g.originalPlayers.find(op => op.user_id === fp.user_id);
+                    if(fpPlayer && fpPlayer.is_demo) demoPortion += bet;
+                  }
+                }
+                // Also demo players in current players who lost
+                for(const pl of players){
+                  if(pl.is_bot || pl.id === p.id) continue;
+                  if(pl.is_demo) demoPortion += bet;
+                }
+                realPortion = winAmount - demoPortion;
+                
+                if(demoPortion > 0 && realPortion > 0){
+                  // Split
+                  await supabase.from('profiles').update({
+                    balance: (winnerProf.balance || 0) + realPortion,
+                    demo_balance: (winnerProf.demo_balance || 0) + demoPortion,
+                    total_wagered: (winnerProf.total_wagered || 0) + bet
+                  }).eq('id', p.user_id);
+                  await supabase.from('transactions').insert([
+                    {user_id: p.user_id, type:'win', amount: realPortion, room_id:roomId, description: `Thắng ${realPortion} thật + ${demoPortion} demo`},
+                    {user_id: p.user_id, type:'win_demo', amount: demoPortion, room_id:roomId, description: `Thắng ${demoPortion} demo từ người chơi demo`}
+                  ]);
+                } else {
+                  await supabase.from('profiles').update({
+                    balance: (winnerProf.balance || 0) + winAmount,
+                    total_wagered: (winnerProf.total_wagered || 0) + bet
+                  }).eq('id', p.user_id);
+                  await supabase.from('transactions').insert([{user_id: p.user_id, type:'win', amount: winAmount, room_id:roomId}]);
+                }
+              }
             }
-            await supabase.from('transactions').insert([{user_id: p.user_id, type:'win', amount: winAmount, room_id:roomId}]);
+            
             await supabase.from('rooms').update({status:'finished', winner_id: p.user_id || null}).eq('id',roomId);
-            io.to(roomId).emit('game-won', {winner: p, number: num, winAmount, fee, totalPot, reason:'bingo', forfeitedAmount: game ? (game.forfeitedAmount || 0) : 0, forfeitedCount});
+            io.to(roomId).emit('game-won', {winner: p, number: num, winAmount, fee, totalPot, reason:'bingo', forfeitedAmount: g ? (g.forfeitedAmount || 0) : 0, isDemoWin: p.is_demo});
             break;
           }
         }
@@ -610,10 +745,8 @@ io.on('connection', (socket)=>{
   socket.on('send-chat', async ({roomId, userId, username, text})=>{
     try{
       if(!roomId || !text) return;
-      // Gioi han do dai tin nhan
       const cleanText = text.toString().trim().slice(0,200);
       if(!cleanText) return;
-      // Spam protection don gian: moi nguoi 1s 1 tin
       const now = Date.now();
       if(socket.data.lastChat && now - socket.data.lastChat < 800){
         return socket.emit('error','Bạn chat quá nhanh!');
@@ -631,8 +764,6 @@ io.on('connection', (socket)=>{
         timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'})
       };
       socket.to(roomId).emit('chat-message', chatData);
-      // Luu vao DB neu muon (optional)
-      // await supabase.from('room_chats').insert({room_id: roomId, user_id: userId, username: chatUsername, message: cleanText});
     }catch(e){ console.log('send-chat error', e.message); }
   });
 
@@ -646,60 +777,63 @@ io.on('connection', (socket)=>{
         leavingUsername = await getUsernameById(leavingUserId);
       }
       if(leavingRoomId && leavingUserId){
-        // Check game state BEFORE deleting player
         const game = activeGames.get(leavingRoomId);
         const isPlaying = game && game.roomData && (game.roomData.status === 'playing' || game.roomData.status === 'counting');
         const betAmount = game ? game.roomData.bet_amount : null;
         
-        // ===== NEW LOGIC: Tự động trừ tiền nếu rời phòng khi đang quay =====
         if(isPlaying && betAmount){
-          // Init tracking for forfeited players
           if(!game.forfeitedPlayers) game.forfeitedPlayers = [];
           if(!game.forfeitedAmount) game.forfeitedAmount = 0;
-          
-          // Check if already forfeited
           const alreadyForfeited = game.forfeitedPlayers.some(p => p.user_id === leavingUserId);
           if(!alreadyForfeited){
-            console.log(`Player ${leavingUserId} left during game ${leavingRoomId}, deducting ${betAmount} and adding to pot`);
-            
-            // Deduct from leaver balance
+            console.log(`Player ${leavingUserId} left during game ${leavingRoomId}, deducting ${betAmount}`);
             try{
-              const {data: prof} = await supabase.from('profiles').select('balance').eq('id', leavingUserId).single();
-              if(prof && prof.balance >= betAmount){
-                await supabase.from('profiles').update({balance: prof.balance - betAmount}).eq('id', leavingUserId);
-                await supabase.from('transactions').insert([{user_id: leavingUserId, type:'forfeit', amount: -betAmount, room_id: leavingRoomId, description: `Rời phòng khi đang quay - mất cược ${betAmount}` }]);
+              const prof = await getProfileById(leavingUserId);
+              if(prof){
+                const playerInGame = game.originalPlayers ? game.originalPlayers.find(pl => pl.user_id === leavingUserId) : null;
+                const isDemo = playerInGame ? playerInGame.is_demo : false;
                 
-                // Add to forfeited tracking
-                game.forfeitedPlayers.push({user_id: leavingUserId, username: leavingUsername, bet: betAmount});
+                if(isDemo){
+                  const newDemo = Math.max(0, (prof.demo_balance || 0) - betAmount);
+                  await supabase.from('profiles').update({
+                    demo_balance: newDemo,
+                    total_wagered: (prof.total_wagered || 0) + betAmount
+                  }).eq('id', leavingUserId);
+                  await supabase.from('transactions').insert([{user_id: leavingUserId, type:'forfeit_demo', amount: -betAmount, room_id: leavingRoomId, description: `Rời phòng khi đang quay - mất ${betAmount} demo`}]);
+                } else {
+                  if((prof.balance || 0) >= betAmount){
+                    await supabase.from('profiles').update({
+                      balance: prof.balance - betAmount,
+                      total_wagered: (prof.total_wagered || 0) + betAmount
+                    }).eq('id', leavingUserId);
+                    await supabase.from('transactions').insert([{user_id: leavingUserId, type:'forfeit', amount: -betAmount, room_id: leavingRoomId, description: `Rời phòng khi đang quay - mất cược ${betAmount}`}]);
+                  }
+                }
+                
+                game.forfeitedPlayers.push({user_id: leavingUserId, username: leavingUsername, bet: betAmount, is_demo: isDemo});
                 game.forfeitedAmount += betAmount;
                 
-                // Update total pot for remaining players display
-                const currentPot = (game.originalPlayers ? game.originalPlayers.length : game.players.length) * betAmount;
-                const newTotalPot = currentPot; // Pot stays same, but winner will get more because leaver's bet is forfeited
                 io.to(leavingRoomId).emit('player-forfeited', {
                   userId: leavingUserId, 
                   username: leavingUsername || 'Người chơi',
                   forfeitedAmount: betAmount,
                   totalForfeited: game.forfeitedAmount,
-                  message: `${leavingUsername || 'Người chơi'} đã rời phòng khi đang quay, mất ${betAmount.toLocaleString()} xu vào pot!`
+                  isDemo: isDemo,
+                  message: `${leavingUsername || 'Người chơi'} đã rời phòng khi đang quay, mất ${betAmount.toLocaleString()} xu ${isDemo ? '(demo)' : ''} vào pot!`
                 });
-                io.to(leavingRoomId).emit('toast', {message: `${leavingUsername || 'Người chơi'} rời phòng khi đang quay, ${betAmount.toLocaleString()} xu của họ sẽ cộng cho người thắng!`, type:'warning'});
+                io.to(leavingRoomId).emit('toast', {message: `${leavingUsername || 'Người chơi'} rời phòng khi đang quay, ${betAmount.toLocaleString()} xu ${isDemo ? 'demo' : ''} của họ sẽ cộng cho người thắng!`, type:'warning'});
               }
             }catch(e){ console.log('forfeit deduct error', e.message); }
           }
         }
         
-        // Xoa khoi room_players
         await supabase.from('room_players').delete().eq('room_id', leavingRoomId).eq('user_id', leavingUserId);
-        // Thong bao cho phong
         io.to(leavingRoomId).emit('player-left', {userId: leavingUserId, username: leavingUsername || 'Người chơi', roomId: leavingRoomId, wasPlaying: !!isPlaying, forfeited: isPlaying ? betAmount : 0});
         const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', leavingRoomId);
         io.to(leavingRoomId).emit('players-update', remainingPlayers);
 
-        // Kiem tra neu dang choi ma chi con 1 nguoi -> auto win
         if(game && game.players){
           const stillInRoom = remainingPlayers.filter(p=>!p.is_bot);
-          // Chi con 1 nguoi that
           if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){
             console.log(`Only 1 player left in room ${leavingRoomId}, auto win for ${stillInRoom[0].user_id}`);
             clearInterval(game.interval);
@@ -711,29 +845,59 @@ io.on('connection', (socket)=>{
             const fee = Math.floor(totalPot * feePercent / 100);
             const winAmount = totalPot - fee;
             const winner = stillInRoom[0];
-            // Tru tien nguoi out (da out roi nhung van tru de cong vao pot) - skip those already forfeited
-            for(const pl of game.originalPlayers){
-              if(pl.user_id && pl.user_id !== winner.user_id){
-                const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
-                if(!alreadyDeducted){
-                  const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
-                  if(prof){
-                    await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
-                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit', amount: -bet, room_id: leavingRoomId}]);
+            // UPDATED per new spec: demo win -> losers only lose demo (if have)
+            if(winner.is_demo){
+              for(const pl of game.originalPlayers){
+                if(pl.user_id && pl.user_id !== winner.user_id){
+                  const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                  if(!alreadyDeducted){
+                    const prof = await getProfileById(pl.user_id);
+                    if(prof){
+                      const demoBal = prof.demo_balance || 0;
+                      if(demoBal > 0){
+                        const deduct = Math.min(demoBal, bet);
+                        await supabase.from('profiles').update({demo_balance: Math.max(0, demoBal-deduct), total_wagered: (prof.total_wagered||0)+deduct}).eq('id',pl.user_id);
+                        await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit_demo', amount: -deduct, room_id: leavingRoomId, description: 'Thua demo (thua người chơi demo - last man)'}]);
+                      } else {
+                        await supabase.from('profiles').update({total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                      }
+                    }
+                  }
+                }
+              }
+            } else {
+              for(const pl of game.originalPlayers){
+                if(pl.user_id && pl.user_id !== winner.user_id){
+                  const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                  if(!alreadyDeducted){
+                    const prof = await getProfileById(pl.user_id);
+                    if(prof){
+                      if(pl.is_demo){
+                        await supabase.from('profiles').update({demo_balance: Math.max(0, (prof.demo_balance||0)-bet), total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                      } else {
+                        await supabase.from('profiles').update({balance: (prof.balance||0)-bet, total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                      }
+                      await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit', amount: -bet, room_id: leavingRoomId}]);
+                    }
                   }
                 }
               }
             }
-            const {data: winnerProf} = await supabase.from('profiles').select('balance').eq('id',winner.user_id).single();
+            const winnerProf = await getProfileById(winner.user_id);
             if(winnerProf){
-              await supabase.from('profiles').update({balance: winnerProf.balance + winAmount}).eq('id',winner.user_id);
+              if(winner.is_demo){
+                await supabase.from('profiles').update({demo_balance: (winnerProf.demo_balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);
+                await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win_demo', amount: winAmount, room_id:leavingRoomId, description: 'Thắng demo last man - người thua chỉ mất demo nếu có'}]);
+              } else {
+                await supabase.from('profiles').update({balance: (winnerProf.balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);
+                await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win', amount: winAmount, room_id:leavingRoomId}]);
+              }
             }
             await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win', amount: winAmount, room_id:leavingRoomId}]);
             await supabase.from('rooms').update({status:'finished', winner_id: winner.user_id}).eq('id',leavingRoomId);
             io.to(leavingRoomId).emit('game-won', {winner: winner, winAmount, fee, totalPot, reason:'last_man_standing', leftCount: originalCount -1, forfeitedAmount: game.forfeitedAmount || 0});
             io.to(leavingRoomId).emit('toast', {message: `Người chơi cuối cùng ${winner.username || 'Bạn'} thắng ${winAmount.toLocaleString()} xu vì mọi người đã rời phòng!`, type:'success'});
           } else if(isPlaying && stillInRoom.length > 1){
-            // Still more than 1 player, but someone left during playing - update pot info
             const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + (game.forfeitedPlayers ? game.forfeitedPlayers.length : 0) + 1);
             const totalPot = originalCount * betAmount;
             io.to(leavingRoomId).emit('pot-updated', {totalPot, forfeitedAmount: game.forfeitedAmount || 0, remainingCount: stillInRoom.length});
@@ -752,21 +916,28 @@ io.on('connection', (socket)=>{
         const isPlaying = game && game.roomData && (game.roomData.status === 'playing' || game.roomData.status === 'counting');
         const betAmount = game ? game.roomData.bet_amount : null;
         
-        // Same forfeit logic as leave-room
         if(isPlaying && betAmount){
           if(!game.forfeitedPlayers) game.forfeitedPlayers = [];
           if(!game.forfeitedAmount) game.forfeitedAmount = 0;
           const alreadyForfeited = game.forfeitedPlayers.some(p => p.user_id === userId);
           if(!alreadyForfeited){
             try{
-              const {data: prof} = await supabase.from('profiles').select('balance').eq('id', userId).single();
-              if(prof && prof.balance >= betAmount){
-                await supabase.from('profiles').update({balance: prof.balance - betAmount}).eq('id', userId);
+              const prof = await getProfileById(userId);
+              if(prof){
+                const playerInGame = game.originalPlayers ? game.originalPlayers.find(pl => pl.user_id === userId) : null;
+                const isDemo = playerInGame ? playerInGame.is_demo : false;
+                if(isDemo){
+                  await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-betAmount), total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
+                } else {
+                  if((prof.balance||0) >= betAmount){
+                    await supabase.from('profiles').update({balance: prof.balance - betAmount, total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
+                  }
+                }
                 await supabase.from('transactions').insert([{user_id: userId, type:'forfeit', amount: -betAmount, room_id: roomId, description: `Mất kết nối khi đang quay - mất cược`}]);
                 const username = await getUsernameById(userId);
-                game.forfeitedPlayers.push({user_id: userId, username: username, bet: betAmount});
+                game.forfeitedPlayers.push({user_id: userId, username: username, bet: betAmount, is_demo: isDemo});
                 game.forfeitedAmount += betAmount;
-                io.to(roomId).emit('player-forfeited', {userId, username: username || 'Người chơi', forfeitedAmount: betAmount, totalForfeited: game.forfeitedAmount});
+                io.to(roomId).emit('player-forfeited', {userId, username: username || 'Người chơi', forfeitedAmount: betAmount, totalForfeited: game.forfeitedAmount, isDemo});
               }
             }catch(e){ console.log('disconnect forfeit error', e.message); }
           }
@@ -789,23 +960,56 @@ io.on('connection', (socket)=>{
             const fee = Math.floor(totalPot * feePercent / 100);
             const winAmount = totalPot - fee;
             const winner = stillInRoom[0];
-            for(const pl of game.originalPlayers){
-              if(pl.user_id && pl.user_id !== winner.user_id){
-                const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
-                if(!alreadyDeducted){
-                  const {data: prof} = await supabase.from('profiles').select('balance').eq('id',pl.user_id).single();
-                  if(prof) {
-                    await supabase.from('profiles').update({balance: prof.balance - bet}).eq('id',pl.user_id);
-                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit', amount: -bet, room_id: roomId}]);
+            // UPDATED per new spec for disconnect last man
+            if(winner.is_demo){
+              for(const pl of game.originalPlayers){
+                if(pl.user_id && pl.user_id !== winner.user_id){
+                  const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                  if(!alreadyDeducted){
+                    const prof = await getProfileById(pl.user_id);
+                    if(prof){
+                      const demoBal = prof.demo_balance || 0;
+                      if(demoBal > 0){
+                        const deduct = Math.min(demoBal, bet);
+                        await supabase.from('profiles').update({demo_balance: Math.max(0, demoBal-deduct), total_wagered: (prof.total_wagered||0)+deduct}).eq('id',pl.user_id);
+                        await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit_demo', amount: -deduct, room_id: roomId, description: 'Thua demo last man disconnect'}]);
+                      } else {
+                        await supabase.from('profiles').update({total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                      }
+                    }
+                  }
+                }
+              }
+            } else {
+              for(const pl of game.originalPlayers){
+                if(pl.user_id && pl.user_id !== winner.user_id){
+                  const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                  if(!alreadyDeducted){
+                    const prof = await getProfileById(pl.user_id);
+                    if(prof){
+                      if(pl.is_demo){
+                        await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-bet), total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                      } else {
+                        await supabase.from('profiles').update({balance: (prof.balance||0)-bet, total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                      }
+                      await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit', amount: -bet, room_id: roomId}]);
+                    }
                   }
                 }
               }
             }
-            const {data: winnerProf} = await supabase.from('profiles').select('balance').eq('id',winner.user_id).single();
-            if(winnerProf) await supabase.from('profiles').update({balance: winnerProf.balance + winAmount}).eq('id',winner.user_id);
-            await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win', amount: winAmount, room_id:roomId}]);
+            const winnerProf = await getProfileById(winner.user_id);
+            if(winnerProf){
+              if(winner.is_demo){
+                await supabase.from('profiles').update({demo_balance: (winnerProf.demo_balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);
+                await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win_demo', amount: winAmount, room_id:roomId, description: 'Thắng demo last man disconnect - người thua chỉ mất demo nếu có'}]);
+              } else {
+                await supabase.from('profiles').update({balance: (winnerProf.balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);
+                await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win', amount: winAmount, room_id:roomId}]);
+              }
+            }
             await supabase.from('rooms').update({status:'finished', winner_id: winner.user_id}).eq('id',roomId);
-            io.to(roomId).emit('game-won', {winner, winAmount, fee, totalPot, reason:'last_man_standing', forfeitedAmount: game.forfeitedAmount || 0});
+            io.to(roomId).emit('game-won', {winner, winAmount, fee, totalPot, reason:'last_man_standing', forfeitedAmount: game.forfeitedAmount || 0, isDemoWin: winner.is_demo});
           }
         }
       }
@@ -814,7 +1018,7 @@ io.on('connection', (socket)=>{
 
 });
 
-app.get('/', (req,res)=> res.send('Loto Online Backend Running - Fixed Audio Sync & Auto Win'));
+app.get('/', (req,res)=> res.send('Loto Online Backend Running - Demo Balance + Withdraw + Admin System - Updated Demo Win Logic'));
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, ()=> console.log('Server running on '+PORT));

@@ -48,37 +48,40 @@ async function getProfileById(userId){
 // ===== UTILS: Tạo vé Loto chuẩn Việt Nam =====
 function generateLotoTicket() {
   const ticket = Array(3).fill(0).map(()=> Array(9).fill(null));
-  const colCounts = Array(9).fill(0);
+  const rowCounts = [0,0,0];
+  
   for(let c=0;c<9;c++){
-    const r = Math.floor(Math.random()*3);
+    let available = [0,1,2].filter(r=> rowCounts[r] < 5);
+    available.sort((a,b)=> rowCounts[a]-rowCounts[b]);
+    let minCount = rowCounts[available[0]];
+    let candidates = available.filter(r=> rowCounts[r]===minCount);
+    const r = candidates[Math.floor(Math.random()*candidates.length)];
     ticket[r][c] = getRandomInCol(c);
-    colCounts[c]++;
+    rowCounts[r]++;
   }
+  
   for(let r=0;r<3;r++){
-    let numsInRow = ticket[r].filter(v=>v!==null).length;
-    while(numsInRow < 5){
+    let needed = 5 - rowCounts[r];
+    let attempts = 0;
+    while(needed > 0 && attempts < 100){
       const c = Math.floor(Math.random()*9);
       if(ticket[r][c]===null){
+        const colCount = (ticket[0][c]!==null?1:0)+(ticket[1][c]!==null?1:0)+(ticket[2][c]!==null?1:0);
+        if(colCount >= 3){ attempts++; continue; }
         let val;
         let tries=0;
         do{
           val = getRandomInCol(c);
           tries++;
-        }while(columnHas(ticket,val,c) && tries<20);
+        }while(columnHas(ticket,val,c) && tries<30);
         ticket[r][c]=val;
-        numsInRow++;
+        rowCounts[r]++;
+        needed--;
       }
-    }
-    while(numsInRow > 5){
-      const filled = ticket[r].map((v,i)=> v!==null?i:null).filter(v=>v!==null);
-      const toRemove = filled[Math.floor(Math.random()*filled.length)];
-      if(colCounts[toRemove] > 1){
-        ticket[r][toRemove]=null;
-        colCounts[toRemove]--;
-        numsInRow--;
-      } else break;
+      attempts++;
     }
   }
+  
   for(let c=0;c<9;c++){
     const vals = [];
     for(let r=0;r<3;r++) if(ticket[r][c]!==null) vals.push(ticket[r][c]);
@@ -86,6 +89,14 @@ function generateLotoTicket() {
     let idx=0;
     for(let r=0;r<3;r++) if(ticket[r][c]!==null) ticket[r][c]=vals[idx++];
   }
+  
+  for(let r=0;r<3;r++){
+    const count = ticket[r].filter(v=>v!==null).length;
+    if(count !== 5){
+      return generateLotoTicket();
+    }
+  }
+  
   return ticket;
 }
 function getRandomInCol(c){

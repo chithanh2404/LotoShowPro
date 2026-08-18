@@ -801,6 +801,7 @@ app.get('/api/rooms/:roomId', async (req,res)=>{
 
 // ===== SOCKET.IO GAME LOOP =====
 const activeGames = new Map();
+const roomAudioModes = new Map();
 
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
@@ -827,6 +828,9 @@ io.on('connection', (socket)=>{
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
     io.to(roomId).emit('room-info', room);
+    const currentAudioMode = roomAudioModes.get(roomId) || room.audio_mode || "MUSIC";
+    io.to(roomId).emit('room-audio-mode', {roomId, mode: currentAudioMode});
+    socket.emit('room-audio-mode', {roomId, mode: currentAudioMode});
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
@@ -852,6 +856,9 @@ io.on('connection', (socket)=>{
     io.to(roomId).emit('players-update', players);
     const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     io.to(roomId).emit('room-info', room);
+    const currentAudioMode = roomAudioModes.get(roomId) || room.audio_mode || "MUSIC";
+    io.to(roomId).emit('room-audio-mode', {roomId, mode: currentAudioMode});
+    socket.emit('room-audio-mode', {roomId, mode: currentAudioMode});
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
@@ -881,6 +888,7 @@ io.on('connection', (socket)=>{
         forfeitedAmount:0,
         clientAcks: new Set(),
         expectedAcks: players.filter(p=>!p.is_bot).length,
+        audioMode: roomAudioModes.get(roomId) || "MUSIC",
         isDrawing: true,
         waitingForAcks: false,
         timeout: null,
@@ -905,8 +913,8 @@ io.on('connection', (socket)=>{
         game.waitingForAcks = true;
 
         await supabase.from('rooms').update({current_numbers: game.drawn}).eq('id',roomId);
-        // Gửi full drawn để frontend đồng bộ ngay, không chờ audio
-        io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId});
+        const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
+        io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId, audioMode: currentRoomAudioMode});
 
         // Kiểm tra thắng với logic FIX (đủ 5 số 1 hàng)
         for(const p of game.players){
@@ -1064,12 +1072,31 @@ io.on('connection', (socket)=>{
       console.log(`[CONTINUE] ${roomId} yêu cầu tiếp tục sau false win`);
       game.isDrawing = true;
       game.waitingForAcks = false;
-      // Tiếp tục sẽ do drawNextWithSync tự chạy, ở đây chỉ reset
       if(game.clientAcks) game.clientAcks.clear();
     } else if(game && game.waitingForAcks){
       game.clientAcks.clear();
       game.waitingForAcks = false;
     }
+  });
+
+  socket.on('change-audio-mode', ({roomId, mode, userId})=>{
+    try{
+      if(!roomId || !mode) return;
+      if(mode!="MUSIC" && mode!="VOICE") return;
+      console.log(`[AUDIO MODE] ${roomId} -> ${mode} by ${userId || socket.id}`);
+      roomAudioModes.set(roomId, mode);
+      const game = activeGames.get(roomId);
+      if(game) game.audioMode = mode;
+      io.to(roomId).emit('audio-mode-changed', {roomId, mode, changedBy: userId, timestamp: Date.now()});
+      try{ supabase.from('rooms').update({audio_mode: mode}).eq('id', roomId).then(()=>{}); }catch(e){}
+    }catch(e){ console.log('change-audio-mode err', e.message); }
+  });
+
+  socket.on('get-room-audio-mode', ({roomId})=>{
+    try{
+      const mode = roomAudioModes.get(roomId) || "MUSIC";
+      socket.emit('room-audio-mode', {roomId, mode});
+    }catch(e){}
   });
 
   socket.on('send-chat', async ({roomId, userId, username, text})=>{

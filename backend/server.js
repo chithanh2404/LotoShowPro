@@ -281,7 +281,7 @@ app.get('/api/withdrawals/all', async (req,res)=>{
     const profile = await getProfileById(userId);
     if(!profile || profile.role !== 'admin') return res.status(403).json({error:'Không có quyền admin'});
     
-    const {data, error} = await supabase.from('withdrawals').select('*, profiles(username, email)').order('created_at', {ascending:false});
+    const {data, error} = await supabase.from('withdrawals').select('*, profiles!withdrawals_user_id_fkey(username, email)').order('created_at', {ascending:false});
     if(error) return res.status(500).json({error:error.message});
     res.json(data || []);
   }catch(e){ res.status(500).json({error:e.message}); }
@@ -310,7 +310,7 @@ app.get('/api/admin/withdrawals', async (req,res)=>{
     const adminProfile = await getProfileById(adminId);
     if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
     
-    let query = supabase.from('withdrawals').select('*, profiles!inner(username, email, balance, demo_balance)').order('created_at', {ascending:false});
+    let query = supabase.from('withdrawals').select('*, profiles!withdrawals_user_id_fkey(username, email, balance, demo_balance)').order('created_at', {ascending:false});
     if(status) query = query.eq('status', status);
     const {data, error} = await query;
     if(error) return res.status(500).json({error:error.message});
@@ -325,7 +325,7 @@ app.post('/api/admin/withdrawals/:id/approve', async (req,res)=>{
     const adminProfile = await getProfileById(adminId);
     if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
     
-    const {data: wd} = await supabase.from('withdrawals').select('*, profiles!inner(balance)').eq('id', id).single();
+    const {data: wd} = await supabase.from('withdrawals').select('*, profiles!withdrawals_user_id_fkey(balance)').eq('id', id).single();
     if(!wd) return res.status(404).json({error:'Withdrawal not found'});
     if(wd.status !== 'pending') return res.status(400).json({error:'Lệnh đã được xử lý'});
     
@@ -393,16 +393,80 @@ app.get('/api/admin/stats', async (req,res)=>{
     const adminProfile = await getProfileById(adminId);
     if(!isAdmin(adminProfile)) return res.status(403).json({error:'Forbidden'});
     
-    // Top winners (by total win amount from transactions)
-    const {data: winStats} = await supabase.from('transactions').select('user_id, amount, profiles(username)').eq('type','win').order('amount', {ascending:false}).limit(20);
-    const {data: loseStats} = await supabase.from('transactions').select('user_id, amount, profiles(username)').eq('type','lose').order('amount', {ascending:true}).limit(20);
+    let winStats = null;
+    let loseStats = null;
+    try{
+      const {data: winnersView} = await supabase.from('admin_top_winners').select('*').limit(20);
+      if(winnersView && winnersView.length>0) winStats = winnersView;
+    }catch(e){ console.log('admin_top_winners view error', e.message); }
     
-    // Users with most withdrawals
-    const {data: withdrawStats} = await supabase.from('withdrawals').select('user_id, amount, profiles(username)').eq('status','approved').order('amount', {ascending:false}).limit(20);
+    try{
+      const {data: losersView} = await supabase.from('admin_top_losers').select('*').limit(20);
+      if(losersView && losersView.length>0) loseStats = losersView;
+    }catch(e){ console.log('admin_top_losers view error', e.message); }
+    
+    if(!winStats){
+      const {data} = await supabase.from('transactions').select('user_id, amount').eq('type','win');
+      if(data){
+        const grouped = {};
+        data.forEach(t=>{
+          if(!grouped[t.user_id]) grouped[t.user_id]={user_id:t.user_id, amount:0, count:0};
+          grouped[t.user_id].amount += t.amount;
+          grouped[t.user_id].count++;
+        });
+        winStats = Object.values(grouped).sort((a,b)=>b.amount-a.amount).slice(0,20);
+        for(let w of winStats){
+          const prof = await getProfileById(w.user_id);
+          w.profiles = {username: prof ? (prof.username||prof.email) : w.user_id.slice(0,8)};
+          w.total_win = w.amount;
+          w.win_count = w.count;
+        }
+      }
+    }
+    
+    if(!loseStats){
+      const {data} = await supabase.from('transactions').select('user_id, amount').eq('type','lose');
+      if(data){
+        const grouped = {};
+        data.forEach(t=>{
+          if(!grouped[t.user_id]) grouped[t.user_id]={user_id:t.user_id, amount:0, count:0};
+          grouped[t.user_id].amount += Math.abs(t.amount);
+          grouped[t.user_id].count++;
+        });
+        loseStats = Object.values(grouped).sort((a,b)=>b.amount-a.amount).slice(0,20);
+        for(let l of loseStats){
+          const prof = await getProfileById(l.user_id);
+          l.profiles = {username: prof ? (prof.username||prof.email) : l.user_id.slice(0,8)};
+          l.total_lose = l.amount;
+          l.lose_count = l.count;
+        }
+      }
+    }
+    
+    let withdrawStats = [];
+    try{
+      const {data} = await supabase.from('withdrawals').select('user_id, amount, profiles!withdrawals_user_id_fkey(username)').eq('status','approved').order('amount', {ascending:false}).limit(20);
+      withdrawStats = data || [];
+    }catch(e){
+      const {data} = await supabase.from('withdrawals').select('user_id, amount').eq('status','approved');
+      if(data){
+        const grouped = {};
+        data.forEach(t=>{
+          if(!grouped[t.user_id]) grouped[t.user_id]={user_id:t.user_id, amount:0};
+          grouped[t.user_id].amount += t.amount;
+        });
+        withdrawStats = Object.values(grouped).sort((a,b)=>b.amount-a.amount).slice(0,20);
+        for(let w of withdrawStats){
+          const prof = await getProfileById(w.user_id);
+          w.profiles = {username: prof ? (prof.username||prof.email) : w.user_id.slice(0,8)};
+        }
+      }
+    }
     
     res.json({topWinners: winStats || [], topLosers: loseStats || [], topWithdrawals: withdrawStats || []});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ console.log('stats error', e); res.status(500).json({error:e.message}); }
 });
+
 
 app.get('/api/admin/transactions/:userId', async (req,res)=>{
   try{

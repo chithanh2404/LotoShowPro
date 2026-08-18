@@ -1008,54 +1008,95 @@ io.on('connection', (socket)=>{
                 const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
         io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId, audioMode: currentRoomAudioMode});
 
-        // Kiểm tra thắng với logic FIX (đủ 5 số 1 hàng)
+        // Kiểm tra thắng - FIX: ÉP TẤT CẢ MÁY QUAY XONG SỐ WIN MỚI DỪNG
+        let winnerFound = null;
+        let winnerInfo = null;
         for(const p of game.players){
           if(p.is_bot) continue;
           const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
           if(winInfo){
-            game.isDrawing = false;
-            if(game.timeout) clearTimeout(game.timeout);
-            activeGames.delete(roomId);
-            const bet = roomData.bet_amount;
-            const feePercent = roomData.fee_percent;
-            const originalCount = game.originalPlayers ? game.originalPlayers.length : game.players.filter(pl=>!pl.is_bot).length;
-            const forfeitedCount = game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
-            const totalPlayersForPot = Math.max(game.players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
-            const totalPot = totalPlayersForPot * bet;
-            const fee = Math.floor(totalPot * feePercent / 100);
-            const winAmount = totalPot - fee;
-            
-            const isDemoWinnerEarly = p.is_demo;
-            if(!isDemoWinnerEarly){
-              for(const pl of game.players){
-                if(pl.is_bot) continue;
-                if(pl.id === p.id) continue;
-                const alreadyForfeited = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
-                if(alreadyForfeited) continue;
-                const prof = await getProfileById(pl.user_id);
-                if(!prof) continue;
-                const isDemoPlayer = pl.is_demo;
-                if(isDemoPlayer){
-                  const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
-                  await supabase.from('profiles').update({
-                    demo_balance: newDemo,
-                    total_wagered: (prof.total_wagered || 0) + bet
-                  }).eq('id', pl.user_id);
-                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo`}]);
-                } else {
-                  const newBal = (prof.balance || 0) - bet;
-                  await supabase.from('profiles').update({
-                    balance: newBal,
-                    total_wagered: (prof.total_wagered || 0) + bet
-                  }).eq('id', pl.user_id);
-                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose', amount: -bet, room_id:roomId}]);
-                }
-              }
+            winnerFound = p;
+            winnerInfo = winInfo;
+            break;
+          }
+        }
+
+        if(winnerFound){
+          // CÓ NGƯỜI THẮNG - KHÔNG DỪNG NGAY, CHỜ TẤT CẢ MÁY QUAY XONG SỐ CUỐI
+          const p = winnerFound;
+          const winInfo = winnerInfo;
+          console.log(`[WIN DETECTED] ${roomId} - Player ${p.user_id} wins with number ${num}, waiting for all clients to finish final spin...`);
+          
+          // Đánh dấu đang chờ win - dừng quay tiếp nhưng chưa xóa game
+          game.isDrawing = false;
+          game.pendingWin = {
+            player: p,
+            winInfo,
+            winningNumber: num,
+            drawn: [...game.drawn],
+            roomData,
+            drawIndex: game.drawn.length - 1
+          };
+          game.waitingForAcks = true;
+          
+          // Gửi thông báo có người thắng nhưng chưa kết thúc, yêu cầu các máy hoàn tất vòng quay
+          io.to(roomId).emit('win-pending', {
+            roomId,
+            winningNumber: num,
+            winnerId: p.user_id,
+            drawIndex: game.drawn.length - 1,
+            message: `Có người thắng với số ${num}, chờ tất cả máy quay xong...`
+          });
+
+          // Chờ tất cả máy báo đã quay xong số win (client-audio-done) rồi mới xử lý thắng thua
+          let waitedForWin = 0;
+          const winCheckInterval = 300;
+          const maxWinWait = 15000; // tối đa 15s chờ tất cả máy quay xong số cuối
+          
+          const checkWinSync = setInterval(async ()=>{
+            waitedForWin += winCheckInterval;
+            const got = game.clientAcks.size;
+            const expected = Math.max(1, game.expectedAcks || 1);
+            const allAcked = got >= expected;
+            const timedOut = waitedForWin >= maxWinWait;
+
+            if(waitedForWin % 1500 < winCheckInterval){
+              console.log(`[WIN SYNC WAIT] ${roomId} - Winning number ${num} - Got ${got}/${expected} acks, waited ${waitedForWin}ms`);
+              io.to(roomId).emit('sync-waiting', {
+                roomId,
+                drawIndex: game.currentDrawIndex,
+                number: num,
+                got,
+                expected,
+                waited: waitedForWin,
+                need: expected - got,
+                isWinningNumber: true,
+                message: `Số thắng ${num} - đang chờ ${expected - got} máy quay xong`
+              });
             }
-            const winnerProf = await getProfileById(p.user_id);
-            if(winnerProf){
-              const isDemoWinner = p.is_demo;
-              if(isDemoWinner){
+
+            if(allAcked || timedOut){
+              clearInterval(checkWinSync);
+              if(timedOut){
+                console.log(`[WIN SYNC TIMEOUT] ${roomId} - Only ${got}/${expected} acks for winning number ${num} after ${waitedForWin}ms, forcing game-won`);
+              } else {
+                console.log(`[WIN SYNC OK] ${roomId} - All ${got}/${expected} clients finished winning number ${num}, now emitting game-won`);
+              }
+
+              // Bây giờ mới xử lý tiền và emit game-won
+              if(game.timeout) clearTimeout(game.timeout);
+              
+              const bet = roomData.bet_amount;
+              const feePercent = roomData.fee_percent;
+              const originalCount = game.originalPlayers ? game.originalPlayers.length : game.players.filter(pl=>!pl.is_bot).length;
+              const forfeitedCount = game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
+              const totalPlayersForPot = Math.max(game.players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
+              const totalPot = totalPlayersForPot * bet;
+              const fee = Math.floor(totalPot * feePercent / 100);
+              const winAmount = totalPot - fee;
+              
+              const isDemoWinnerEarly = p.is_demo;
+              if(!isDemoWinnerEarly){
                 for(const pl of game.players){
                   if(pl.is_bot) continue;
                   if(pl.id === p.id) continue;
@@ -1063,64 +1104,120 @@ io.on('connection', (socket)=>{
                   if(alreadyForfeited) continue;
                   const prof = await getProfileById(pl.user_id);
                   if(!prof) continue;
-                  const demoBal = prof.demo_balance || 0;
-                  if(demoBal > 0){
-                    const deduct = Math.min(demoBal, bet);
-                    const newDemo = Math.max(0, demoBal - deduct);
+                  const isDemoPlayer = pl.is_demo;
+                  if(isDemoPlayer){
+                    const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
                     await supabase.from('profiles').update({
                       demo_balance: newDemo,
-                      total_wagered: (prof.total_wagered || 0) + deduct
-                    }).eq('id', pl.user_id);
-                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -deduct, room_id:roomId, description: `Thua ${deduct} demo (thua người chơi demo)`}]);
-                  } else {
-                    await supabase.from('profiles').update({
                       total_wagered: (prof.total_wagered || 0) + bet
                     }).eq('id', pl.user_id);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo`}]);
+                  } else {
+                    const newBal = (prof.balance || 0) - bet;
+                    await supabase.from('profiles').update({
+                      balance: newBal,
+                      total_wagered: (prof.total_wagered || 0) + bet
+                    }).eq('id', pl.user_id);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose', amount: -bet, room_id:roomId}]);
                   }
-                }
-                const newDemo = (winnerProf.demo_balance || 0) + winAmount;
-                await supabase.from('profiles').update({
-                  demo_balance: newDemo,
-                  total_wagered: (winnerProf.total_wagered || 0) + bet
-                }).eq('id', p.user_id);
-                await supabase.from('transactions').insert([{user_id: p.user_id, type:'win_demo', amount: winAmount, room_id:roomId, description: `Thắng ${winAmount} demo - người thua chỉ mất demo (nếu có)`}]);
-              } else {
-                let demoPortion = 0;
-                let realPortion = winAmount;
-                if(game.forfeitedPlayers){
-                  for(const fp of game.forfeitedPlayers){
-                    const fpPlayer = game.originalPlayers.find(op => op.user_id === fp.user_id);
-                    if(fpPlayer && fpPlayer.is_demo) demoPortion += bet;
-                  }
-                }
-                for(const pl of game.players){
-                  if(pl.is_bot || pl.id === p.id) continue;
-                  if(pl.is_demo) demoPortion += bet;
-                }
-                realPortion = winAmount - demoPortion;
-                if(demoPortion > 0 && realPortion > 0){
-                  await supabase.from('profiles').update({
-                    balance: (winnerProf.balance || 0) + realPortion,
-                    demo_balance: (winnerProf.demo_balance || 0) + demoPortion,
-                    total_wagered: (winnerProf.total_wagered || 0) + bet
-                  }).eq('id', p.user_id);
-                  await supabase.from('transactions').insert([
-                    {user_id: p.user_id, type:'win', amount: realPortion, room_id:roomId, description: `Thắng ${realPortion} thật + ${demoPortion} demo`},
-                    {user_id: p.user_id, type:'win_demo', amount: demoPortion, room_id:roomId, description: `Thắng ${demoPortion} demo từ người chơi demo`}
-                  ]);
-                } else {
-                  await supabase.from('profiles').update({
-                    balance: (winnerProf.balance || 0) + winAmount,
-                    total_wagered: (winnerProf.total_wagered || 0) + bet
-                  }).eq('id', p.user_id);
-                  await supabase.from('transactions').insert([{user_id: p.user_id, type:'win', amount: winAmount, room_id:roomId}]);
                 }
               }
+              const winnerProf = await getProfileById(p.user_id);
+              if(winnerProf){
+                const isDemoWinner = p.is_demo;
+                if(isDemoWinner){
+                  for(const pl of game.players){
+                    if(pl.is_bot) continue;
+                    if(pl.id === p.id) continue;
+                    const alreadyForfeited = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                    if(alreadyForfeited) continue;
+                    const prof = await getProfileById(pl.user_id);
+                    if(!prof) continue;
+                    const demoBal = prof.demo_balance || 0;
+                    if(demoBal > 0){
+                      const deduct = Math.min(demoBal, bet);
+                      const newDemo = Math.max(0, demoBal - deduct);
+                      await supabase.from('profiles').update({
+                        demo_balance: newDemo,
+                        total_wagered: (prof.total_wagered || 0) + deduct
+                      }).eq('id', pl.user_id);
+                      await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -deduct, room_id:roomId, description: `Thua ${deduct} demo (thua người chơi demo)`}]);
+                    } else {
+                      await supabase.from('profiles').update({
+                        total_wagered: (prof.total_wagered || 0) + bet
+                      }).eq('id', pl.user_id);
+                    }
+                  }
+                  const newDemo = (winnerProf.demo_balance || 0) + winAmount;
+                  await supabase.from('profiles').update({
+                    demo_balance: newDemo,
+                    total_wagered: (winnerProf.total_wagered || 0) + bet
+                  }).eq('id', p.user_id);
+                  await supabase.from('transactions').insert([{user_id: p.user_id, type:'win_demo', amount: winAmount, room_id:roomId, description: `Thắng ${winAmount} demo - người thua chỉ mất demo (nếu có)`}]);
+                } else {
+                  let demoPortion = 0;
+                  let realPortion = winAmount;
+                  if(game.forfeitedPlayers){
+                    for(const fp of game.forfeitedPlayers){
+                      const fpPlayer = game.originalPlayers.find(op => op.user_id === fp.user_id);
+                      if(fpPlayer && fpPlayer.is_demo) demoPortion += bet;
+                    }
+                  }
+                  for(const pl of game.players){
+                    if(pl.is_bot || pl.id === p.id) continue;
+                    if(pl.is_demo) demoPortion += bet;
+                  }
+                  realPortion = winAmount - demoPortion;
+                  if(demoPortion > 0 && realPortion > 0){
+                    await supabase.from('profiles').update({
+                      balance: (winnerProf.balance || 0) + realPortion,
+                      demo_balance: (winnerProf.demo_balance || 0) + demoPortion,
+                      total_wagered: (winnerProf.total_wagered || 0) + bet
+                    }).eq('id', p.user_id);
+                    await supabase.from('transactions').insert([
+                      {user_id: p.user_id, type:'win', amount: realPortion, room_id:roomId, description: `Thắng ${realPortion} thật + ${demoPortion} demo`},
+                      {user_id: p.user_id, type:'win_demo', amount: demoPortion, room_id:roomId, description: `Thắng ${demoPortion} demo từ người chơi demo`}
+                    ]);
+                  } else {
+                    await supabase.from('profiles').update({
+                      balance: (winnerProf.balance || 0) + winAmount,
+                      total_wagered: (winnerProf.total_wagered || 0) + bet
+                    }).eq('id', p.user_id);
+                    await supabase.from('transactions').insert([{user_id: p.user_id, type:'win', amount: winAmount, room_id:roomId}]);
+                  }
+                }
+              }
+              await supabase.from('rooms').update({status:'finished', winner_id: p.user_id || null}).eq('id',roomId);
+              
+              // Xóa game sau khi đã chờ xong
+              activeGames.delete(roomId);
+              
+              // Emit game-won - lúc này tất cả máy đã quay xong số cuối
+              io.to(roomId).emit('game-won', {
+                winner: p, 
+                number: num, 
+                drawn: [...game.drawn], 
+                winningRow: winInfo.row, 
+                winningNumbers: winInfo.numbers, 
+                winAmount, 
+                fee, 
+                totalPot, 
+                reason:'bingo', 
+                forfeitedAmount: game.forfeitedAmount || 0, 
+                isDemoWin: p.is_demo,
+                finalSpinCompleted: true
+              });
+
+              // Đảm bảo nút bắt đầu lại được mở cho ván mới
+              io.to(roomId).emit('game-finished-can-restart', {
+                roomId,
+                canRestart: true,
+                message: 'Ván kết thúc, có thể bắt đầu lại'
+              });
             }
-            await supabase.from('rooms').update({status:'finished', winner_id: p.user_id || null}).eq('id',roomId);
-            io.to(roomId).emit('game-won', {winner: p, number: num, drawn: [...game.drawn], winningRow: winInfo.row, winningNumbers: winInfo.numbers, winAmount, fee, totalPot, reason:'bingo', forfeitedAmount: game.forfeitedAmount || 0, isDemoWin: p.is_demo});
-            break;
-          }
+          }, winCheckInterval);
+          
+          return; // Dừng drawNext, chờ sync win
         }
 
         // Nếu chưa ai thắng, CHỜ ĐỦ TẤT CẢ MÁY trong phòng báo audio xong mới quay tiếp

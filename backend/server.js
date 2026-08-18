@@ -784,6 +784,81 @@ app.post('/api/rooms', async (req,res)=>{
   res.json(data);
 });
 
+app.get('/api/rooms', async (req,res)=>{
+  try{
+    const {data: rooms, error} = await supabase.from('rooms').select('*').order('created_at', {ascending:false}).limit(50);
+    if(error) return res.status(500).json({error: error.message});
+    
+    // Lọc phòng đang hoạt động (chưa finished hoặc finished trong 5 phút gần đây để vẫn hiện)
+    const now = new Date();
+    const activeRooms = [];
+    
+    for(const room of rooms || []){
+      // Bỏ phòng SOLO? Giữ lại phòng riêng thôi, bỏ SOLO khỏi danh sách chung
+      if(room.id && room.id.startsWith('SOLO-')) continue;
+      // Chỉ lấy phòng chưa finished hoặc mới finished
+      if(room.status === 'finished'){
+        const updatedAt = room.updated_at ? new Date(room.updated_at) : new Date(room.created_at);
+        const diffMinutes = (now - updatedAt) / 1000 / 60;
+        if(diffMinutes > 10) continue; // bỏ phòng finished quá 10 phút
+      }
+      
+      // Lấy số người chơi
+      const {data: players} = await supabase.from('room_players').select('user_id, is_bot').eq('room_id', room.id);
+      const realPlayers = players ? players.filter(p=>!p.is_bot) : [];
+      const totalPlayers = players ? players.length : 0;
+      
+      // Lấy tiến trình từ activeGames
+      let drawnCount = 0;
+      let progress = 0;
+      let isPlaying = false;
+      const game = activeGames.get(room.id);
+      if(game){
+        drawnCount = game.drawn ? game.drawn.length : 0;
+        progress = Math.round((drawnCount / 90) * 100);
+        isPlaying = !!game.isDrawing;
+      } else {
+        // Nếu không có trong activeGames, thử lấy từ rooms.current_numbers nếu có
+        if(room.current_numbers && Array.isArray(room.current_numbers)){
+          drawnCount = room.current_numbers.length;
+          progress = Math.round((drawnCount / 90) * 100);
+        }
+      }
+      
+      activeRooms.push({
+        id: room.id,
+        name: room.name || 'Phòng '+room.id,
+        hasPassword: !!(room.password),
+        has_password: !!(room.password),
+        playerCount: realPlayers.length,
+        realPlayersCount: realPlayers.length,
+        totalPlayers: totalPlayers,
+        maxPlayers: room.max_players || 5,
+        bet_amount: room.bet_amount || room.bet || 0,
+        fee: room.fee_percent || room.fee || 20,
+        status: room.status || 'waiting',
+        drawnCount: drawnCount,
+        progress: progress,
+        isPlaying: isPlaying,
+        created_at: room.created_at,
+        host_id: room.host_id
+      });
+    }
+    
+    // Sắp xếp: đang chơi lên đầu, rồi theo số người
+    activeRooms.sort((a,b)=>{
+      if(a.isPlaying && !b.isPlaying) return -1;
+      if(!a.isPlaying && b.isPlaying) return 1;
+      return b.playerCount - a.playerCount;
+    });
+    
+    res.json({rooms: activeRooms, count: activeRooms.length});
+  }catch(e){
+    console.log('get active rooms error', e.message);
+    res.status(500).json({error: e.message});
+  }
+});
+
 app.get('/api/rooms/:roomId/taken-tickets', async (req,res)=>{
   const {roomId} = req.params;
   try{

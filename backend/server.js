@@ -801,6 +801,7 @@ app.get('/api/rooms/:roomId', async (req,res)=>{
 
 // ===== SOCKET.IO GAME LOOP =====
 const activeGames = new Map();
+const roomAudioModes = new Map(); // audio mode sync
 
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
@@ -827,6 +828,9 @@ io.on('connection', (socket)=>{
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
     io.to(roomId).emit('room-info', room);
+    const currentAudioMode = roomAudioModes.get(roomId) || room.audio_mode || "MUSIC";
+    io.to(roomId).emit('room-audio-mode', {roomId, mode: currentAudioMode});
+    socket.emit('room-audio-mode', {roomId, mode: currentAudioMode});
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
@@ -852,6 +856,9 @@ io.on('connection', (socket)=>{
     io.to(roomId).emit('players-update', players);
     const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     io.to(roomId).emit('room-info', room);
+    const currentAudioMode = roomAudioModes.get(roomId) || room.audio_mode || "MUSIC";
+    io.to(roomId).emit('room-audio-mode', {roomId, mode: currentAudioMode});
+    socket.emit('room-audio-mode', {roomId, mode: currentAudioMode});
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
@@ -868,7 +875,7 @@ io.on('connection', (socket)=>{
       const drawnSet = new Set();
       const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
       const {data: roomData} = await supabase.from('rooms').select('*').eq('id',roomId).single();
-      // FIX SYNC STRICT: chờ đủ 2 máy báo audio xong mới quay tiếp
+      // FIX SYNC DYNAMIC: chờ đủ TẤT CẢ máy trong phòng (động: 2 máy=>2, 3 máy=>3, 4 máy=>4...)
       const realPlayers = players.filter(p=>!p.is_bot);
       const gameState = {
         drawn,
@@ -938,7 +945,8 @@ io.on('connection', (socket)=>{
 
         await supabase.from('rooms').update({current_numbers: game.drawn}).eq('id',roomId);
         // Gửi full drawn để frontend đồng bộ ngay, không chờ audio
-        io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId});
+                const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
+        io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId, audioMode: currentRoomAudioMode});
 
         // Kiểm tra thắng với logic FIX (đủ 5 số 1 hàng)
         for(const p of game.players){
@@ -1191,7 +1199,27 @@ io.on('connection', (socket)=>{
       });
     }
   });
-  socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
+  
+  // ===== AUDIO MODE SYNC: đồng bộ chế độ audio cho cả phòng (động) =====
+  socket.on('change-audio-mode', ({roomId, mode, userId})=>{
+    try{
+      if(!roomId || !mode) return;
+      console.log(`[AUDIO MODE CHANGE] ${roomId} - Player ${userId} changed mode to ${mode}`);
+      roomAudioModes.set(roomId, mode);
+      const game = activeGames.get(roomId);
+      if(game) game.audioMode = mode;
+      io.to(roomId).emit('audio-mode-changed', {roomId, mode, userId});
+    }catch(e){ console.log('change-audio-mode err', e.message); }
+  });
+
+  socket.on('get-room-audio-mode', ({roomId})=>{
+    try{
+      const mode = roomAudioModes.get(roomId) || "MUSIC";
+      socket.emit('room-audio-mode', {roomId, mode});
+    }catch(e){}
+  });
+
+socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
     console.warn(`[FALSE WIN] ${roomId} client báo win ảo ${winner?.username||winner?.user_id} - ${reason} - drawn ${drawnCount}`);
   });
   socket.on('request-continue-game', ({roomId})=>{

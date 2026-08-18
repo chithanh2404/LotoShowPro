@@ -670,12 +670,14 @@ app.post('/api/sepay/webhook', async (req, res) => {
       // return res.json({ success: false, message: `Amount ${amount} less than expected ${matchedDeposit.amount}` });
     }
 
-    // Cong tien cho user
-    const { data: profile } = await supabase.from('profiles').select('balance').eq('id', matchedDeposit.user_id).single();
+    // Cong tien cho user + cap nhat total_deposited
+    const { data: profile } = await supabase.from('profiles').select('balance, total_deposited').eq('id', matchedDeposit.user_id).single();
     const currentBalance = profile ? (profile.balance || 0) : 0;
+    const currentDeposited = profile ? (profile.total_deposited || 0) : 0;
     const newBalance = currentBalance + matchedDeposit.amount;
+    const newDeposited = currentDeposited + matchedDeposit.amount;
 
-    await supabase.from('profiles').update({ balance: newBalance }).eq('id', matchedDeposit.user_id);
+    await supabase.from('profiles').update({ balance: newBalance, total_deposited: newDeposited }).eq('id', matchedDeposit.user_id);
 
     // Cap nhat trang thai deposit
     await supabase.from('deposits').update({
@@ -715,9 +717,10 @@ app.post('/api/deposit/manual-confirm', async (req, res) => {
     if(!dep) return res.status(404).json({error: 'Deposit not found'});
     if(dep.status === 'success') return res.json({message: 'Already success', deposit: dep});
 
-    const { data: profile } = await supabase.from('profiles').select('balance').eq('id', dep.user_id).single();
+    const { data: profile } = await supabase.from('profiles').select('balance, total_deposited').eq('id', dep.user_id).single();
     const newBalance = (profile.balance || 0) + dep.amount;
-    await supabase.from('profiles').update({ balance: newBalance }).eq('id', dep.user_id);
+    const newDeposited = (profile.total_deposited || 0) + dep.amount;
+    await supabase.from('profiles').update({ balance: newBalance, total_deposited: newDeposited }).eq('id', dep.user_id);
     await supabase.from('deposits').update({ status: 'success', confirmed_at: new Date().toISOString() }).eq('id', dep.id);
     await supabase.from('transactions').insert([{ user_id: dep.user_id, type: 'deposit', amount: dep.amount, description: `Manual confirm ${dep.transfer_content}` }]);
     res.json({ success: true, newBalance, deposit: dep });

@@ -1100,11 +1100,11 @@ io.on('connection', (socket)=>{
                 const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
         io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId, audioMode: currentRoomAudioMode});
 
-        // Kiểm tra thắng - FIX: ÉP TẤT CẢ MÁY QUAY XONG SỐ WIN MỚI DỪNG
+        // Kiểm tra thắng - FIX: BAO GỒM CẢ BOT - bot thắng cũng trừ tiền người chơi như người thật
         let winnerFound = null;
         let winnerInfo = null;
         for(const p of game.players){
-          if(p.is_bot) continue;
+          // KHÔNG skip bot nữa - bot cũng được tính thắng để trừ tiền người chơi
           const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
           if(winInfo){
             winnerFound = p;
@@ -1187,8 +1187,40 @@ io.on('connection', (socket)=>{
               const fee = Math.floor(totalPot * feePercent / 100);
               const winAmount = totalPot - fee;
               
+              const isBotWinner = p.is_bot;
               const isDemoWinnerEarly = p.is_demo;
-              if(!isDemoWinnerEarly){
+              
+              // BOT THẮNG: trừ tiền tất cả người chơi thật (như thua người thật)
+              if(isBotWinner){
+                console.log(`[BOT WIN] ${roomId} - Bot ${p.bot_name} wins! Deducting ${bet} from all real players`);
+                for(const pl of game.players){
+                  if(pl.is_bot) continue;
+                  const alreadyForfeited = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                  if(alreadyForfeited) continue;
+                  const prof = await getProfileById(pl.user_id);
+                  if(!prof) continue;
+                  const isDemoPlayer = pl.is_demo;
+                  if(isDemoPlayer){
+                    const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
+                    await supabase.from('profiles').update({
+                      demo_balance: newDemo,
+                      total_wagered: (prof.total_wagered || 0) + bet
+                    }).eq('id', pl.user_id);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo - bot ${p.bot_name} thắng`}]);
+                  } else {
+                    const newBal = (prof.balance || 0) - bet;
+                    await supabase.from('profiles').update({
+                      balance: newBal,
+                      total_wagered: (prof.total_wagered || 0) + bet
+                    }).eq('id', pl.user_id);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose', amount: -bet, room_id:roomId, description: `Thua ${bet} - bot ${p.bot_name} thắng`}]);
+                  }
+                }
+                // Bot thắng thì pot thuộc về nhà (hoặc không ai), chỉ tính fee
+                // Vẫn emit game-won để client hiển thị bot thắng
+              }
+              
+              if(!isDemoWinnerEarly && !isBotWinner){
                 for(const pl of game.players){
                   if(pl.is_bot) continue;
                   if(pl.id === p.id) continue;

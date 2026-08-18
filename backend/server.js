@@ -98,11 +98,29 @@ function columnHas(ticket,val,c){
   return false;
 }
 function checkWin(ticket, drawnSet){
+  if(!ticket || !drawnSet) return false;
   for(let r=0;r<3;r++){
-    const rowNums = ticket[r].filter(v=>v!==null);
+    const row = ticket[r];
+    if(!row) continue;
+    const rowNums = row.filter(v=> v!==null && v!==undefined);
+    // FIX: phải đủ 5 số mới tính thắng, tránh vé lỗi báo ảo
+    if(rowNums.length !== 5) continue;
     if(rowNums.every(n=>drawnSet.has(n))) return true;
   }
   return false;
+}
+function getWinningRowInfo(ticket, drawnSet){
+  if(!ticket || !drawnSet) return null;
+  for(let r=0;r<3;r++){
+    const row = ticket[r];
+    if(!row) continue;
+    const rowNums = row.filter(v=> v!==null && v!==undefined);
+    if(rowNums.length !== 5) continue;
+    if(rowNums.every(n=>drawnSet.has(n))){
+      return { row: r, numbers: rowNums };
+    }
+  }
+  return null;
 }
 
 function getAudioVariantForNumber(num, drawIndex, roomId){
@@ -839,55 +857,80 @@ io.on('connection', (socket)=>{
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
   });
 
-  socket.on('start-game', async ({roomId})=>{
+    socket.on('start-game', async ({roomId})=>{
     if(activeGames.has(roomId)) return;
     await supabase.from('rooms').update({status:'counting'}).eq('id',roomId);
     io.to(roomId).emit('countdown-start');
     setTimeout(async ()=>{
       await supabase.from('rooms').update({status:'playing', current_numbers:[]}).eq('id',roomId);
       const allNumbers = Array.from({length:90},(_,i)=>i+1).sort(()=>Math.random()-0.5);
-      let idx=0;
       const drawn = [];
       const drawnSet = new Set();
       const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
       const {data: roomData} = await supabase.from('rooms').select('*').eq('id',roomId).single();
-      activeGames.set(roomId, {drawn, players, originalPlayers: [...players], roomData, allNumbers, forfeitedPlayers:[], forfeitedAmount:0});
-      const interval = setInterval(async ()=>{
-        if(idx>=90){ clearInterval(interval); activeGames.delete(roomId); return; }
-        const num = allNumbers[idx];
-        const audioVariant = getAudioVariantForNumber(num, idx, roomId);
-        drawn.push(num);
-        drawnSet.add(num);
-        idx++;
-        await supabase.from('rooms').update({current_numbers:drawn}).eq('id',roomId);
-        io.to(roomId).emit('number-drawn', {number:num, drawn, audioVariant, drawIndex: drawn.length-1});
-        const game = activeGames.get(roomId);
-        if(game){ game.drawn = drawn; }
+      // FIX SYNC: thêm clientAcks và barrier để chờ tất cả máy đọc xong mới ra số tiếp
+      const gameState = {
+        drawn,
+        drawnSet,
+        players,
+        originalPlayers: [...players],
+        roomData,
+        allNumbers,
+        currentIdx: 0,
+        forfeitedPlayers:[],
+        forfeitedAmount:0,
+        clientAcks: new Set(),
+        expectedAcks: players.filter(p=>!p.is_bot).length,
+        isDrawing: true,
+        waitingForAcks: false,
+        timeout: null,
+        interval: null
+      };
+      activeGames.set(roomId, gameState);
 
-        for(const p of players){
+      const drawNextWithSync = async ()=>{
+        const game = activeGames.get(roomId);
+        if(!game || !game.isDrawing) return;
+        if(game.currentIdx >= 90){
+          activeGames.delete(roomId);
+          io.to(roomId).emit('game-ended', {reason:'no numbers left'});
+          return;
+        }
+        const num = game.allNumbers[game.currentIdx];
+        const audioVariant = getAudioVariantForNumber(num, game.currentIdx, roomId);
+        game.drawn.push(num);
+        game.drawnSet.add(num);
+        game.currentIdx++;
+        game.clientAcks.clear();
+        game.waitingForAcks = true;
+
+        await supabase.from('rooms').update({current_numbers: game.drawn}).eq('id',roomId);
+        // Gửi full drawn để frontend đồng bộ ngay, không chờ audio
+        io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId});
+
+        // Kiểm tra thắng với logic FIX (đủ 5 số 1 hàng)
+        for(const p of game.players){
           if(p.is_bot) continue;
-          if(checkWin(p.ticket, drawnSet)){
-            clearInterval(interval);
-            const g = activeGames.get(roomId);
+          const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
+          if(winInfo){
+            game.isDrawing = false;
+            if(game.timeout) clearTimeout(game.timeout);
             activeGames.delete(roomId);
             const bet = roomData.bet_amount;
             const feePercent = roomData.fee_percent;
-            const originalCount = g && g.originalPlayers ? g.originalPlayers.length : players.filter(pl=>!pl.is_bot).length;
-            const forfeitedCount = g && g.forfeitedPlayers ? g.forfeitedPlayers.length : 0;
-            const totalPlayersForPot = Math.max(players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
+            const originalCount = game.originalPlayers ? game.originalPlayers.length : game.players.filter(pl=>!pl.is_bot).length;
+            const forfeitedCount = game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
+            const totalPlayersForPot = Math.max(game.players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
             const totalPot = totalPlayersForPot * bet;
             const fee = Math.floor(totalPot * feePercent / 100);
             const winAmount = totalPot - fee;
             
-            // Process win/loss with demo handling - UPDATED per new spec
-            // If winner is demo, losers only lose demo (if have)
             const isDemoWinnerEarly = p.is_demo;
             if(!isDemoWinnerEarly){
-              // Real winner: losers lose according to their own bet type
-              for(const pl of players){
+              for(const pl of game.players){
                 if(pl.is_bot) continue;
                 if(pl.id === p.id) continue;
-                const alreadyForfeited = g && g.forfeitedPlayers && g.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                const alreadyForfeited = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
                 if(alreadyForfeited) continue;
                 const prof = await getProfileById(pl.user_id);
                 if(!prof) continue;
@@ -909,19 +952,14 @@ io.on('connection', (socket)=>{
                 }
               }
             }
-            // For demo winner, loser deduction is handled inside winner block below to ensure only demo is deducted
-            
-            // Winner - UPDATED per new spec: demo win -> losers only lose demo (if have), win goes to demo
             const winnerProf = await getProfileById(p.user_id);
             if(winnerProf){
               const isDemoWinner = p.is_demo;
               if(isDemoWinner){
-                // NEW LOGIC: Thắng → cộng vào demo_balance (người thua cũng chỉ mất tiền demo (nếu có), tiền thắng demo vẫn vào demo)
-                // So losers only lose demo balance if they have it
-                for(const pl of players){
+                for(const pl of game.players){
                   if(pl.is_bot) continue;
                   if(pl.id === p.id) continue;
-                  const alreadyForfeited = g && g.forfeitedPlayers && g.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                  const alreadyForfeited = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
                   if(alreadyForfeited) continue;
                   const prof = await getProfileById(pl.user_id);
                   if(!prof) continue;
@@ -935,13 +973,11 @@ io.on('connection', (socket)=>{
                     }).eq('id', pl.user_id);
                     await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -deduct, room_id:roomId, description: `Thua ${deduct} demo (thua người chơi demo)`}]);
                   } else {
-                    // No demo to lose - still count wager but no deduction (per spec: chỉ mất demo nếu có)
                     await supabase.from('profiles').update({
                       total_wagered: (prof.total_wagered || 0) + bet
                     }).eq('id', pl.user_id);
                   }
                 }
-                // Winner gets all winAmount to demo
                 const newDemo = (winnerProf.demo_balance || 0) + winAmount;
                 await supabase.from('profiles').update({
                   demo_balance: newDemo,
@@ -949,28 +985,20 @@ io.on('connection', (socket)=>{
                 }).eq('id', p.user_id);
                 await supabase.from('transactions').insert([{user_id: p.user_id, type:'win_demo', amount: winAmount, room_id:roomId, description: `Thắng ${winAmount} demo - người thua chỉ mất demo (nếu có)`}]);
               } else {
-                // Real winner: if there are demo losers, their loss goes to demo? Per spec: demo loser's money goes to winner's demo? 
-                // Spec says: demo player loses -> deduct demo, but add to winner's demo
-                // To implement: if any loser was demo, that portion goes to winner's demo, rest to real
-                // Simplified: winner gets winAmount to real balance, but we track demo portion separately
                 let demoPortion = 0;
                 let realPortion = winAmount;
-                // Calculate demo portion from forfeited and demo losers
-                if(g && g.forfeitedPlayers){
-                  for(const fp of g.forfeitedPlayers){
-                    const fpPlayer = g.originalPlayers.find(op => op.user_id === fp.user_id);
+                if(game.forfeitedPlayers){
+                  for(const fp of game.forfeitedPlayers){
+                    const fpPlayer = game.originalPlayers.find(op => op.user_id === fp.user_id);
                     if(fpPlayer && fpPlayer.is_demo) demoPortion += bet;
                   }
                 }
-                // Also demo players in current players who lost
-                for(const pl of players){
+                for(const pl of game.players){
                   if(pl.is_bot || pl.id === p.id) continue;
                   if(pl.is_demo) demoPortion += bet;
                 }
                 realPortion = winAmount - demoPortion;
-                
                 if(demoPortion > 0 && realPortion > 0){
-                  // Split
                   await supabase.from('profiles').update({
                     balance: (winnerProf.balance || 0) + realPortion,
                     demo_balance: (winnerProf.demo_balance || 0) + demoPortion,
@@ -989,16 +1017,59 @@ io.on('connection', (socket)=>{
                 }
               }
             }
-            
             await supabase.from('rooms').update({status:'finished', winner_id: p.user_id || null}).eq('id',roomId);
-            io.to(roomId).emit('game-won', {winner: p, number: num, winAmount, fee, totalPot, reason:'bingo', forfeitedAmount: g ? (g.forfeitedAmount || 0) : 0, isDemoWin: p.is_demo});
+            io.to(roomId).emit('game-won', {winner: p, number: num, drawn: [...game.drawn], winningRow: winInfo.row, winningNumbers: winInfo.numbers, winAmount, fee, totalPot, reason:'bingo', forfeitedAmount: game.forfeitedAmount || 0, isDemoWin: p.is_demo});
             break;
           }
         }
-      }, 4000);
-      const game = activeGames.get(roomId);
-      if(game) game.interval = interval;
+
+        // Nếu chưa ai thắng, chờ đồng bộ tất cả thiết bị
+        let waited = 0;
+        const checkSync = setInterval(()=>{
+          waited += 300;
+          const got = game.clientAcks.size;
+          const expected = Math.max(1, game.expectedAcks);
+          if(got >= expected || waited >= 7000){
+            clearInterval(checkSync);
+            game.waitingForAcks = false;
+            game.timeout = setTimeout(drawNextWithSync, 1200);
+          }
+        }, 300);
+      };
+
+      drawNextWithSync();
+
     }, 4000);
+  });
+
+  // ===== FIX SYNC HANDLERS =====
+  socket.on('client-audio-done', ({roomId, userId, drawIndex})=>{
+    const game = activeGames.get(roomId);
+    if(!game) return;
+    if(userId) game.clientAcks.add(userId);
+    else game.clientAcks.add(socket.id);
+  });
+  socket.on('client-ready-for-next', ({roomId, userId})=>{
+    const game = activeGames.get(roomId);
+    if(!game) return;
+    if(userId) game.clientAcks.add(userId);
+    else game.clientAcks.add(socket.id);
+  });
+  socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
+    console.warn(`[FALSE WIN] ${roomId} client báo win ảo ${winner?.username||winner?.user_id} - ${reason} - drawn ${drawnCount}`);
+  });
+  socket.on('request-continue-game', ({roomId})=>{
+    const game = activeGames.get(roomId);
+    if(game && !game.isDrawing){
+      console.log(`[CONTINUE] ${roomId} yêu cầu tiếp tục sau false win`);
+      game.isDrawing = true;
+      game.waitingForAcks = false;
+      // Tiếp tục sẽ do drawNextWithSync tự chạy, ở đây chỉ reset
+      if(game.clientAcks) game.clientAcks.clear();
+    } else if(game && game.waitingForAcks){
+      game.clientAcks.clear();
+      game.waitingForAcks = false;
+    }
   });
 
   socket.on('send-chat', async ({roomId, userId, username, text})=>{

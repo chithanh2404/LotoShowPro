@@ -801,7 +801,6 @@ app.get('/api/rooms/:roomId', async (req,res)=>{
 
 // ===== SOCKET.IO GAME LOOP =====
 const activeGames = new Map();
-const roomAudioModes = new Map(); // audio mode sync
 
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
@@ -828,9 +827,6 @@ io.on('connection', (socket)=>{
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
     io.to(roomId).emit('room-info', room);
-    const currentAudioMode = roomAudioModes.get(roomId) || room.audio_mode || "MUSIC";
-    io.to(roomId).emit('room-audio-mode', {roomId, mode: currentAudioMode});
-    socket.emit('room-audio-mode', {roomId, mode: currentAudioMode});
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
@@ -856,9 +852,6 @@ io.on('connection', (socket)=>{
     io.to(roomId).emit('players-update', players);
     const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     io.to(roomId).emit('room-info', room);
-    const currentAudioMode = roomAudioModes.get(roomId) || room.audio_mode || "MUSIC";
-    io.to(roomId).emit('room-audio-mode', {roomId, mode: currentAudioMode});
-    socket.emit('room-audio-mode', {roomId, mode: currentAudioMode});
     const joinedPlayer = players.find(p=>p.user_id===userId);
     const joinedUsername = joinedPlayer ? (joinedPlayer.username || await getUsernameById(userId) || 'Người chơi') : (await getUsernameById(userId) || 'Người chơi');
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
@@ -875,7 +868,8 @@ io.on('connection', (socket)=>{
       const drawnSet = new Set();
       const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
       const {data: roomData} = await supabase.from('rooms').select('*').eq('id',roomId).single();
-      // FIX SYNC: thêm clientAcks và barrier để chờ tất cả máy đọc xong mới ra số tiếp
+      // FIX SYNC STRICT: chờ đủ 2 máy báo audio xong mới quay tiếp
+      const realPlayers = players.filter(p=>!p.is_bot);
       const gameState = {
         drawn,
         drawnSet,
@@ -886,14 +880,18 @@ io.on('connection', (socket)=>{
         currentIdx: 0,
         forfeitedPlayers:[],
         forfeitedAmount:0,
-        clientAcks: new Set(),
-        expectedAcks: players.filter(p=>!p.is_bot).length,
-        audioMode: roomAudioModes.get(roomId) || "MUSIC",
+        // Cơ chế đồng bộ audio: chờ tất cả máy báo xong
+        clientAcks: new Set(), // Set userId đã báo xong audio cho số hiện tại
+        expectedAcks: Math.max(1, realPlayers.length), // Số máy cần chờ = số người chơi thực trong phòng (động: 2 máy=>2, 3 máy=>3, 4 máy=>4...)
+        currentDrawIndex: -1, // Index của số vừa quay
+        lastDrawTime: null,
         isDrawing: true,
         waitingForAcks: false,
         timeout: null,
-        interval: null
+        interval: null,
+        audioSyncEnabled: true // Bật cơ chế chờ đồng bộ
       };
+      console.log(`[GAME START] ${roomId} - ${realPlayers.length} players, expectedAcks=${gameState.expectedAcks}, audioSyncEnabled=true`);
       activeGames.set(roomId, gameState);
 
       const drawNextWithSync = async ()=>{
@@ -909,12 +907,38 @@ io.on('connection', (socket)=>{
         game.drawn.push(num);
         game.drawnSet.add(num);
         game.currentIdx++;
+        // Reset ack cho số mới, lưu index hiện tại - QUAN TRỌNG: chờ đủ TẤT CẢ máy trong phòng
         game.clientAcks.clear();
+        game.currentDrawIndex = game.drawn.length - 1;
+        game.lastDrawTime = Date.now();
         game.waitingForAcks = true;
+        // Cập nhật expectedAcks động theo số người chơi thực tế CÒN LẠI trong phòng
+        // Phòng có 2 máy thì chờ 2, 3 máy thì chờ 3, 4 máy thì chờ 4...
+        try{
+          const activeRealPlayers = game.players ? game.players.filter(p=>!p.is_bot).length : game.expectedAcks;
+          // Trừ đi những người đã forfeited (đã rời)
+          const forfeitedCount = game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
+          const stillActive = Math.max(1, activeRealPlayers - 0); // giữ nguyên active, forfeited đã được xử lý ở player-left
+          if(stillActive > 0) {
+            if(stillActive !== game.expectedAcks){
+              console.log(`[SYNC RESET] ${roomId} new draw #${game.currentDrawIndex} (num ${num}) - expectedAcks ${game.expectedAcks} -> ${stillActive} (active players)`);
+            }
+            game.expectedAcks = Math.max(1, stillActive);
+          }
+          console.log(`[DRAW] ${roomId} - Draw #${game.currentDrawIndex}: number ${num}, waiting for ${game.expectedAcks} players to finish audio`);
+          // Thông báo cho clients biết đang chờ bao nhiêu máy
+          io.to(roomId).emit('draw-started', {
+            roomId,
+            drawIndex: game.currentDrawIndex,
+            number: num,
+            expected: game.expectedAcks,
+            drawn: [...game.drawn]
+          });
+        }catch(e){}
 
         await supabase.from('rooms').update({current_numbers: game.drawn}).eq('id',roomId);
-        const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
-        io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId, audioMode: currentRoomAudioMode});
+        // Gửi full drawn để frontend đồng bộ ngay, không chờ audio
+        io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId});
 
         // Kiểm tra thắng với logic FIX (đủ 5 số 1 hàng)
         for(const p of game.players){
@@ -1031,38 +1055,77 @@ io.on('connection', (socket)=>{
           }
         }
 
-        // Nếu chưa ai thắng, chờ đồng bộ tất cả thiết bị (fix nhảy số)
+        // Nếu chưa ai thắng, CHỜ ĐỦ TẤT CẢ MÁY trong phòng báo audio xong mới quay tiếp
+        // Cơ chế động: phòng có bao nhiêu máy chơi thì chờ đủ bấy nhiêu máy (2 máy=>2, 3 máy=>3, 5 máy=>5...)
         let waited = 0;
-        // Cập nhật expectedAcks theo số người chơi hiện tại còn trong phòng
-        const updateExpected = ()=>{
+        const checkInterval = 300;
+        const maxWaitTime = 20000; // 20s timeout an toàn nếu có máy disconnect
+        const expectedPlayers = ()=> {
           try{
-            const currentPlayers = game.players ? game.players.filter(p=>!p.is_bot) : [];
-            // Nếu có forfeited, trừ đi
-            const activeCount = currentPlayers.length;
-            // Lấy số người thực tế đang trong phòng (từ room_players nếu có)
-            return Math.max(1, activeCount);
-          }catch(e){ return Math.max(1, game.expectedAcks || 1); }
-        };
-        const checkSync = setInterval(()=>{
-          waited += 300;
-          const got = game.clientAcks.size;
-          const expected = updateExpected();
-          // Log để debug
-          if(waited % 1500 < 300){
-            console.log(`[SYNC WAIT] ${roomId} got ${got}/${expected} acks, waited ${waited}ms`);
-          }
-          // Chờ đủ ack hoặc timeout 15s (tăng từ 7s để đủ thời gian đọc số)
-          if(got >= expected || waited >= 15000){
-            clearInterval(checkSync);
-            if(got < expected){
-              console.log(`[SYNC TIMEOUT] ${roomId} only ${got}/${expected} acks after ${waited}ms, continuing anyway`);
-            } else {
-              console.log(`[SYNC OK] ${roomId} all ${got}/${expected} clients ready, drawing next`);
+            // Tính lại số người chơi thực còn lại trong phòng (động)
+            const currentReal = game.players ? game.players.filter(p=>!p.is_bot).length : 1;
+            // Nếu có người rời, cập nhật expectedAcks giảm xuống
+            const activeFromDB = game.forfeitedPlayers ? currentReal : currentReal;
+            const expected = Math.max(1, activeFromDB);
+            // Cập nhật lại expectedAcks để log chính xác
+            if(expected !== game.expectedAcks){
+              console.log(`[SYNC UPDATE] ${roomId} expectedAcks updated ${game.expectedAcks} -> ${expected} (players left)`);
+              game.expectedAcks = expected;
             }
+            return expected;
+          }catch(e){
+            return Math.max(1, game.expectedAcks || 1);
+          }
+        };
+        
+        const checkSync = setInterval(()=>{
+          waited += checkInterval;
+          const got = game.clientAcks.size;
+          const expected = expectedPlayers();
+          const allAcked = got >= expected;
+          const timedOut = waited >= maxWaitTime;
+          
+          // Log mỗi 1.5s để debug
+          if(waited % 1500 < checkInterval){
+            console.log(`[SYNC WAIT] ${roomId} - Draw #${game.currentDrawIndex} (${game.drawn[game.drawn.length-1]}) - Got ${got}/${expected} audio-done acks, waited ${waited}ms, need ${expected - got} more`);
+            // Gửi trạng thái chờ cho clients để hiển thị
+            io.to(roomId).emit('sync-waiting', {
+              roomId,
+              drawIndex: game.currentDrawIndex,
+              number: game.drawn[game.drawn.length-1],
+              got,
+              expected,
+              waited,
+              need: expected - got
+            });
+          }
+          
+          if(allAcked){
+            clearInterval(checkSync);
+            console.log(`[SYNC OK] ${roomId} - All ${got}/${expected} players reported audio done for draw #${game.currentDrawIndex}, drawing next in 1.2s`);
+            io.to(roomId).emit('sync-complete', {
+              roomId,
+              drawIndex: game.currentDrawIndex,
+              got,
+              expected
+            });
+            game.waitingForAcks = false;
+            game.timeout = setTimeout(drawNextWithSync, 1200);
+          } else if(timedOut){
+            // Timeout an toàn: nếu 1 máy disconnect, vẫn cho tiếp tục
+            clearInterval(checkSync);
+            console.log(`[SYNC TIMEOUT] ${roomId} - Only ${got}/${expected} acks after ${waited}ms for draw #${game.currentDrawIndex}, forcing next draw (maybe player disconnected)`);
+            io.to(roomId).emit('sync-timeout', {
+              roomId,
+              drawIndex: game.currentDrawIndex,
+              got,
+              expected,
+              waited
+            });
             game.waitingForAcks = false;
             game.timeout = setTimeout(drawNextWithSync, 1200);
           }
-        }, 300);
+        }, checkInterval);
       };
 
       drawNextWithSync();
@@ -1070,23 +1133,62 @@ io.on('connection', (socket)=>{
     }, 4000);
   });
 
-  // ===== FIX SYNC HANDLERS - đảm bảo các máy đợi nhau cùng quay =====
-  socket.on('client-audio-done', ({roomId, userId, drawIndex})=>{
+  // ===== DYNAMIC SYNC HANDLERS: chờ đủ TẤT CẢ máy trong phòng (không cố định 2) =====
+  // Phòng có bao nhiêu máy chơi thì chờ đủ bấy nhiêu máy: 2 máy=>2, 3 máy=>3, 4 máy=>4...
+  socket.on('client-audio-done', ({roomId, userId, drawIndex, timestamp})=>{
     const game = activeGames.get(roomId);
     if(!game) return;
+    if(!game.waitingForAcks){
+      return;
+    }
+    if(typeof drawIndex === 'number' && drawIndex !== -1 && game.currentDrawIndex !== -1 && drawIndex !== game.currentDrawIndex){
+      console.log(`[ACK IGNORED] ${roomId} client ${userId} ack for old drawIndex ${drawIndex}, current is ${game.currentDrawIndex}`);
+      return;
+    }
     const id = userId || socket.id;
     if(!game.clientAcks.has(id)){
       game.clientAcks.add(id);
-      console.log(`[ACK] ${roomId} client ${id} done audio drawIndex ${drawIndex}, total ${game.clientAcks.size}/${game.expectedAcks}`);
+      const got = game.clientAcks.size;
+      const expected = game.expectedAcks;
+      console.log(`[AUDIO DONE] ${roomId} - Player ${id} finished audio for draw #${game.currentDrawIndex} (number ${game.drawn[game.drawn.length-1]}), total ${got}/${expected} - Need ${expected - got} more`);
+      io.to(roomId).emit('player-audio-done', {
+        roomId,
+        userId: id,
+        drawIndex: game.currentDrawIndex,
+        number: game.drawn[game.drawn.length-1],
+        got,
+        expected,
+        need: expected - got,
+        allDone: got >= expected
+      });
+      // Nếu đã đủ tất cả máy, log ngay
+      if(got >= expected){
+        console.log(`[ALL DONE] ${roomId} - Got all ${got}/${expected} audio-done acks for draw #${game.currentDrawIndex}, will draw next soon`);
+      }
+    } else {
+      console.log(`[DUPLICATE ACK] ${roomId} - Player ${id} already acked for draw #${game.currentDrawIndex}`);
     }
   });
   socket.on('client-ready-for-next', ({roomId, userId})=>{
     const game = activeGames.get(roomId);
     if(!game) return;
+    if(!game.waitingForAcks) return;
     const id = userId || socket.id;
     if(!game.clientAcks.has(id)){
       game.clientAcks.add(id);
-      console.log(`[ACK-READY] ${roomId} client ${id} ready, total ${game.clientAcks.size}/${game.expectedAcks}`);
+      const got = game.clientAcks.size;
+      const expected = game.expectedAcks;
+      console.log(`[READY FOR NEXT] ${roomId} - Player ${id} ready, total ${got}/${expected} - Need ${expected - got} more`);
+      io.to(roomId).emit('player-audio-done', {
+        roomId,
+        userId: id,
+        drawIndex: game.currentDrawIndex,
+        number: game.drawn[game.drawn.length-1],
+        got,
+        expected,
+        need: expected - got,
+        allDone: got >= expected
+      });
     }
   });
   socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
@@ -1106,23 +1208,6 @@ io.on('connection', (socket)=>{
     }
   });
 
-
-  socket.on('change-audio-mode', ({roomId, mode, userId})=>{
-    try{
-      if(!roomId || !mode) return;
-      roomAudioModes.set(roomId, mode);
-      const game = activeGames.get(roomId);
-      if(game) game.audioMode = mode;
-      io.to(roomId).emit('audio-mode-changed', {roomId, mode});
-    }catch(e){}
-  });
-
-  socket.on('get-room-audio-mode', ({roomId})=>{
-    try{
-      const mode = roomAudioModes.get(roomId) || "MUSIC";
-      socket.emit('room-audio-mode', {roomId, mode});
-    }catch(e){}
-  });
   socket.on('send-chat', async ({roomId, userId, username, text})=>{
     try{
       if(!roomId || !text) return;
@@ -1329,6 +1414,18 @@ io.on('connection', (socket)=>{
         io.to(roomId).emit('player-left', {userId, username: username || 'Người chơi', roomId, wasPlaying: !!isPlaying});
         const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
         io.to(roomId).emit('players-update', remainingPlayers);
+        // Cập nhật expectedAcks khi có người rời - giảm số máy cần chờ
+        if(game){
+          const stillReal = remainingPlayers.filter(p=>!p.is_bot).length;
+          if(stillReal >= 0 && stillReal !== game.expectedAcks){
+            console.log(`[PLAYER LEFT SYNC] ${roomId} - Player left, expectedAcks ${game.expectedAcks} -> ${Math.max(1, stillReal)} (remaining real players: ${stillReal})`);
+            game.expectedAcks = Math.max(1, stillReal);
+            // Nếu đang chờ và đã đủ ack theo số mới, cho quay tiếp luôn
+            if(game.waitingForAcks && game.clientAcks.size >= game.expectedAcks){
+              console.log(`[SYNC UPDATE] ${roomId} - After player left, already have enough acks ${game.clientAcks.size}/${game.expectedAcks}, will proceed`);
+            }
+          }
+        }
         if(game){
           const stillInRoom = remainingPlayers.filter(p=>!p.is_bot);
           if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){

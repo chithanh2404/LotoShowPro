@@ -1633,7 +1633,20 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
 
         if(game && game.players){
           const stillInRoom = remainingPlayers.filter(p=>!p.is_bot);
-          if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){
+          if(stillInRoom.length === 0 && game.roomData && game.roomData.status !== 'finished'){
+            console.log(`[BOT ONLY] Room ${leavingRoomId || roomId} - No real players left, ending game to avoid sync hang 0/1`);
+            if(game.interval) clearInterval(game.interval);
+            if(game.timeout) clearTimeout(game.timeout);
+            if(game.clientAcks) game.clientAcks.clear();
+            game.waitingForAcks = false;
+            activeGames.delete(leavingRoomId || roomId);
+            try{
+              await supabase.from('rooms').update({status:'finished'}).eq('id', leavingRoomId || roomId);
+            }catch(e){}
+            io.to(leavingRoomId || roomId).emit('game-ended', {reason:'all_left', message:'Tất cả người chơi đã rời phòng'});
+            io.to(leavingRoomId || roomId).emit('sync-complete', {roomId: leavingRoomId || roomId, reason:'no_real_players', got:0, expected:0});
+            io.to(leavingRoomId || roomId).emit('room-closed', {roomId: leavingRoomId || roomId, reason:'no_players'});
+          } else if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){
             console.log(`Only 1 player left in room ${leavingRoomId}, auto win for ${stillInRoom[0].user_id}`);
             clearInterval(game.interval);
             activeGames.delete(leavingRoomId);
@@ -1757,13 +1770,19 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
             console.log(`[DISCONNECT CLEANUP] Phòng ${roomId} trống -> đã xóa`);
           }
         }
-        // Cập nhật expectedAcks khi có người rời - giảm số máy cần chờ
+        // FIX 1913: tránh treo 0/1 khi chỉ còn bot
         if(game){
           const stillReal = remainingPlayers.filter(p=>!p.is_bot).length;
-          if(stillReal >= 0 && stillReal !== game.expectedAcks){
+          if(stillReal === 0){
+            console.log(`[PLAYER LEFT SYNC] ${roomId} - No real players left, clearing sync wait (was ${game.clientAcks.size}/${game.expectedAcks}) to avoid hang 0/1`);
+            game.expectedAcks = 0;
+            if(game.clientAcks) game.clientAcks.clear();
+            game.waitingForAcks = false;
+            io.to(roomId).emit('sync-complete', {roomId, reason:'no_real_players', got:0, expected:0});
+            io.to(roomId).emit('sync-waiting', {roomId, got:0, expected:0, need:0});
+          } else if(stillReal >= 0 && stillReal !== game.expectedAcks){
             console.log(`[PLAYER LEFT SYNC] ${roomId} - Player left, expectedAcks ${game.expectedAcks} -> ${Math.max(1, stillReal)} (remaining real players: ${stillReal})`);
             game.expectedAcks = Math.max(1, stillReal);
-            // Nếu đang chờ và đã đủ ack theo số mới, cho quay tiếp luôn
             if(game.waitingForAcks && game.clientAcks.size >= game.expectedAcks){
               console.log(`[SYNC UPDATE] ${roomId} - After player left, already have enough acks ${game.clientAcks.size}/${game.expectedAcks}, will proceed`);
             }
@@ -1771,7 +1790,20 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         }
         if(game){
           const stillInRoom = remainingPlayers.filter(p=>!p.is_bot);
-          if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){
+          if(stillInRoom.length === 0 && game.roomData && game.roomData.status !== 'finished'){
+            console.log(`[BOT ONLY] Room ${leavingRoomId || roomId} - No real players left, ending game to avoid sync hang 0/1`);
+            if(game.interval) clearInterval(game.interval);
+            if(game.timeout) clearTimeout(game.timeout);
+            if(game.clientAcks) game.clientAcks.clear();
+            game.waitingForAcks = false;
+            activeGames.delete(leavingRoomId || roomId);
+            try{
+              await supabase.from('rooms').update({status:'finished'}).eq('id', leavingRoomId || roomId);
+            }catch(e){}
+            io.to(leavingRoomId || roomId).emit('game-ended', {reason:'all_left', message:'Tất cả người chơi đã rời phòng'});
+            io.to(leavingRoomId || roomId).emit('sync-complete', {roomId: leavingRoomId || roomId, reason:'no_real_players', got:0, expected:0});
+            io.to(leavingRoomId || roomId).emit('room-closed', {roomId: leavingRoomId || roomId, reason:'no_players'});
+          } else if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){
             clearInterval(game.interval);
             activeGames.delete(roomId);
             const bet = game.roomData.bet_amount;

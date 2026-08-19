@@ -1030,11 +1030,51 @@ io.on('connection', (socket)=>{
     io.to(roomId).emit('player-joined', {userId, username: joinedUsername, roomId});
   });
 
-    socket.on('start-game', async ({roomId})=>{
+    socket.on('start-game', async ({roomId, userId})=>{
     if(activeGames.has(roomId)) return;
+
+    // === FIX BACKEND: BẮT BUỘC ÍT NHẤT 2 NGƯỜI TRONG PHÒNG RIÊNG ===
+    try{
+      const {data: playersCheck, error: playersCheckErr} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+      if(playersCheckErr) console.log('[START-GAME] fetch players error', playersCheckErr.message);
+      const realPlayersCheck = (playersCheck||[]).filter(p=>!p.is_bot);
+      const isSoloRoomCheck = roomId && roomId.startsWith('SOLO-');
+      if(!isSoloRoomCheck && realPlayersCheck.length < 2){
+        console.log(`[BLOCKED] ${roomId} start blocked - only ${realPlayersCheck.length} real player(s), need 2`);
+        io.to(roomId).emit('toast', {
+          message: `⚠️ Phòng riêng cần ít nhất 2 người mới được bắt đầu! Hiện có ${realPlayersCheck.length}/2 người. Hãy chia sẻ ID phòng để mời thêm bạn!`,
+          type: 'warning'
+        });
+        io.to(roomId).emit('game-error', {
+          code: 'NEED_2_PLAYERS',
+          message: 'Phòng riêng cần ít nhất 2 người',
+          current: realPlayersCheck.length,
+          required: 2
+        });
+        await supabase.from('rooms').update({status:'waiting'}).eq('id', roomId);
+        return;
+      }
+    }catch(e){
+      console.log('[START-GAME] check min players error', e.message);
+    }
+
     await supabase.from('rooms').update({status:'counting'}).eq('id',roomId);
     io.to(roomId).emit('countdown-start');
     setTimeout(async ()=>{
+      // Check lại lần 2 ngay trước khi bắt đầu quay (tránh race khi có người out trong lúc đếm ngược)
+      try{
+        const {data: playersRecheck} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+        const realRecheck = (playersRecheck||[]).filter(p=>!p.is_bot);
+        const isSoloRecheck = roomId && roomId.startsWith('SOLO-');
+        if(!isSoloRecheck && realRecheck.length < 2){
+          console.log(`[BLOCKED-COUNTDOWN] ${roomId} - not enough players after countdown (${realRecheck.length}/2)`);
+          io.to(roomId).emit('toast', {message:'❌ Không đủ 2 người, đã hủy bắt đầu! Mời thêm bạn vào.', type:'error'});
+          await supabase.from('rooms').update({status:'waiting'}).eq('id', roomId);
+          io.to(roomId).emit('game-cancelled', {reason:'not_enough_players', current: realRecheck.length});
+          return;
+        }
+      }catch(e){ console.log('recheck error', e.message); }
+
       await supabase.from('rooms').update({status:'playing', current_numbers:[]}).eq('id',roomId);
       const allNumbers = Array.from({length:90},(_,i)=>i+1).sort(()=>Math.random()-0.5);
       const drawn = [];

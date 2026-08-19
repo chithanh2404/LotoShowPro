@@ -1840,39 +1840,61 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
 });
 
 
-// ===== AUTO CLEANUP: XÓA PHÒNG TRỐNG KHỎI DATABASE =====
+// ===== AUTO CLEANUP: XÓA PHÒNG TRỐNG + PHÒNG CŨ KẸT =====
 async function cleanupEmptyRooms(){
   try{
-    const {data: allRooms} = await supabase.from('rooms').select('id, created_at, updated_at, status').neq('status','finished').limit(100);
+    const {data: allRooms} = await supabase.from('rooms').select('id, created_at, updated_at, status').neq('status','finished').limit(150);
     if(!allRooms || allRooms.length===0) return;
+    const now = Date.now();
     
     for(const room of allRooms){
       if(room.id && room.id.startsWith('SOLO-')) continue;
-      // Bỏ qua phòng mới tạo < 3 phút để tránh xóa phòng vừa tạo chưa kịp join
       const createdAt = new Date(room.created_at);
-      if((Date.now() - createdAt.getTime()) < 3*60*1000) continue;
+      const updatedAt = room.updated_at ? new Date(room.updated_at) : createdAt;
+      const ageMinutes = (now - createdAt.getTime()) / 1000 / 60;
+      const idleMinutes = (now - updatedAt.getTime()) / 1000 / 60;
+
+      // Bỏ qua phòng mới tạo < 3 phút
+      if(ageMinutes < 3) continue;
 
       const {data: players, error} = await supabase.from('room_players').select('id, is_bot').eq('room_id', room.id);
       if(error) continue;
       const total = players ? players.length : 0;
       const realCount = players ? players.filter(p=>!p.is_bot).length : 0;
+      const game = activeGames.get(room.id);
       
+      // 1. Phòng 0 người -> xóa luôn
       if(total === 0){
         await supabase.from('rooms').delete().eq('id', room.id);
         activeGames.delete(room.id);
-        console.log(`[CLEANUP-JOB] Đã xóa phòng trống hoàn toàn ${room.id}`);
-      } else if(realCount === 0){
-        // Phòng chỉ có bot hoặc không có người thật quá 10 phút -> xóa nếu không đang playing
-        const game = activeGames.get(room.id);
+        console.log(`[CLEANUP] Xóa phòng trống hoàn toàn ${room.id}`);
+        continue;
+      }
+      // 2. Phòng chỉ có bot -> xóa sau 10 phút idle
+      if(realCount === 0){
         if(!game || !game.isDrawing){
-          const updatedAt = room.updated_at ? new Date(room.updated_at) : createdAt;
-          if((Date.now() - updatedAt.getTime()) > 10*60*1000){
+          if(idleMinutes > 10){
             await supabase.from('room_players').delete().eq('room_id', room.id);
             await supabase.from('rooms').delete().eq('id', room.id);
             activeGames.delete(room.id);
-            console.log(`[CLEANUP-JOB] Xóa phòng không có người thật ${room.id}`);
+            console.log(`[CLEANUP] Xóa phòng không có người thật ${room.id}`);
           }
         }
+        continue;
+      }
+      // 3. Phòng chờ (waiting) mà tạo quá 90 phút và vẫn < 2 người -> dọn (bị kẹt từ 17/08)
+      if(room.status === 'waiting' && ageMinutes > 90 && realCount < 2){
+        await supabase.from('room_players').delete().eq('room_id', room.id);
+        await supabase.from('rooms').update({status:'finished'}).eq('id', room.id);
+        // hoặc delete hẳn:
+        // await supabase.from('rooms').delete().eq('id', room.id);
+        console.log(`[CLEANUP] Dọn phòng chờ kẹt >90p ${room.id} (${realCount} người)`);
+        continue;
+      }
+      // 4. Phòng đang playing nhưng không có trong activeGames (server restart) và idle > 30p -> finished
+      if(room.status === 'playing' && !game && idleMinutes > 30){
+        await supabase.from('rooms').update({status:'finished'}).eq('id', room.id);
+        console.log(`[CLEANUP] Kết thúc phòng playing kẹt ${room.id} (không có game trong RAM)`);
       }
     }
   }catch(e){

@@ -781,6 +781,9 @@ app.post('/api/rooms', async (req,res)=>{
   const ticketColor = req.body.ticketColor || '#00d2ff';
   const is_demo = !!isDemo;
   await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
+  // Cache host
+  roomHosts.set(id, hostId);
+  roomReadyStates.set(id, new Map());
   res.json(data);
 });
 
@@ -893,7 +896,26 @@ app.get('/api/rooms/:roomId', async (req,res)=>{
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id', roomId);
     const hasBots = players ? players.some(p=>p.is_bot) : false;
     const realPlayers = players ? players.filter(p=>!p.is_bot) : [];
-    res.json({...room, players, hasBots, realPlayersCount: realPlayers.length, totalPlayers: players ? players.length : 0});
+    const game = activeGames.get(roomId);
+    const isPlaying = room.status === 'playing' || (game && game.isDrawing);
+    // ==== NEW: return hostId, status, isPlaying, ready states ====
+    const readyMap = roomReadyStates.get(roomId);
+    const playersWithReady = (players || []).map(p=>{
+      const isReady = readyMap ? !!readyMap.get(p.user_id) : false;
+      return {...p, isReady};
+    });
+    res.json({
+      ...room, 
+      players: playersWithReady, 
+      hasBots, 
+      realPlayersCount: realPlayers.length, 
+      totalPlayers: players ? players.length : 0,
+      hostId: room.host_id || roomHosts.get(roomId) || null,
+      host_id: room.host_id || roomHosts.get(roomId) || null,
+      status: room.status,
+      isPlaying,
+      audioMode: roomAudioModes.get(roomId) || room.audio_mode || 'MUSIC'
+    });
   }catch(e){
     res.status(500).json({error: e.message});
   }
@@ -902,6 +924,8 @@ app.get('/api/rooms/:roomId', async (req,res)=>{
 // ===== SOCKET.IO GAME LOOP =====
 const activeGames = new Map();
 const roomAudioModes = new Map(); // audio mode sync
+const roomReadyStates = new Map(); // roomId -> Map(userId -> isReady)
+const roomHosts = new Map(); // roomId -> hostId cache
 
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
@@ -909,6 +933,12 @@ io.on('connection', (socket)=>{
   socket.on('join-room', async ({roomId, userId, password, ticket, ticketColor, isDemo})=>{
     const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     if(!room) return socket.emit('error','Phòng không tồn tại');
+    // ==== NEW: CHẶN VÀO PHÒNG KHI ĐANG QUAY ====
+    const existingGame = activeGames.get(roomId);
+    if(room.status === 'playing' || room.status === 'counting' || (existingGame && existingGame.isDrawing)){
+      console.log(`[JOIN BLOCKED] ${roomId} - Room is playing/counting, blocking join for ${userId}`);
+      return socket.emit('join-blocked-playing', {roomId, message: 'Phòng đang quay số, vui lòng chờ ván sau!'});
+    }
     if(room.password && room.password!==password) return socket.emit('error','Sai mật khẩu phòng');
     socket.join(roomId);
     socket.data.userId = userId;
@@ -932,8 +962,27 @@ io.on('connection', (socket)=>{
       }
     }
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
-    io.to(roomId).emit('players-update', players);
-    io.to(roomId).emit('room-info', room);
+    // Cache host
+    if(room.host_id){
+      roomHosts.set(roomId, room.host_id);
+    } else if(!roomHosts.has(roomId) && players && players.length>0){
+      // First player becomes host if no host
+      const firstReal = players.find(p=>!p.is_bot);
+      if(firstReal){
+        roomHosts.set(roomId, firstReal.user_id);
+        try{ await supabase.from('rooms').update({host_id: firstReal.user_id}).eq('id', roomId); }catch(e){}
+      }
+    }
+    // Add ready info to players
+    const readyMapForJoin = roomReadyStates.get(roomId);
+    const playersWithReady = (players||[]).map(p=>{
+      const isReady = readyMapForJoin ? !!readyMapForJoin.get(p.user_id) : false;
+      return {...p, isReady};
+    });
+    io.to(roomId).emit('players-update', playersWithReady);
+    // Emit room-info with hostId and status
+    const hostIdToSend = room.host_id || roomHosts.get(roomId) || null;
+    io.to(roomId).emit('room-info', {...room, hostId: hostIdToSend, host_id: hostIdToSend, status: room.status || 'waiting', isPlaying: room.status==='playing'});
     const currentAudioMode = roomAudioModes.get(roomId) || room.audio_mode || "MUSIC";
     io.to(roomId).emit('room-audio-mode', {roomId, mode: currentAudioMode});
     socket.emit('room-audio-mode', {roomId, mode: currentAudioMode});
@@ -1033,8 +1082,17 @@ io.on('connection', (socket)=>{
     socket.on('start-game', async ({roomId, userId})=>{
     if(activeGames.has(roomId)) return;
 
-    // === FIX BACKEND: BẮT BUỘC ÍT NHẤT 2 NGƯỜI TRONG PHÒNG RIÊNG ===
+    // === NEW: CHECK HOST + READY ===
     try{
+      const {data: roomCheck} = await supabase.from('rooms').select('*').eq('id', roomId).single();
+      const hostId = roomCheck ? roomCheck.host_id : roomHosts.get(roomId);
+      // Chỉ chủ phòng mới được bắt đầu
+      if(hostId && userId && hostId !== userId){
+        console.log(`[BLOCKED] ${roomId} start blocked - ${userId} not host (${hostId})`);
+        io.to(roomId).emit('toast', {message: '🚫 Chỉ chủ phòng mới được bắt đầu!', type:'warning'});
+        return socket.emit('error', 'Chỉ chủ phòng mới được bắt đầu');
+      }
+
       const {data: playersCheck, error: playersCheckErr} = await supabase.from('room_players').select('*').eq('room_id', roomId);
       if(playersCheckErr) console.log('[START-GAME] fetch players error', playersCheckErr.message);
       const realPlayersCheck = (playersCheck||[]).filter(p=>!p.is_bot);
@@ -1054,8 +1112,26 @@ io.on('connection', (socket)=>{
         await supabase.from('rooms').update({status:'waiting'}).eq('id', roomId);
         return;
       }
+
+      // Kiểm tra tất cả non-host đã sẵn sàng chưa
+      if(!isSoloRoomCheck){
+        const readyMap = roomReadyStates.get(roomId);
+        const nonHost = realPlayersCheck.filter(p=>p.user_id !== hostId);
+        if(nonHost.length>0){
+          const notReady = nonHost.filter(p=>{
+            const isReady = readyMap ? readyMap.get(p.user_id) : false;
+            return !isReady;
+          });
+          if(notReady.length>0){
+            console.log(`[BLOCKED] ${roomId} start blocked - ${notReady.length} players not ready`);
+            io.to(roomId).emit('start-blocked-not-ready', {ready: nonHost.length - notReady.length, total: nonHost.length});
+            io.to(roomId).emit('toast', {message: `⚠️ Chờ ${notReady.length} người chưa sẵn sàng! (${nonHost.length - notReady.length}/${nonHost.length})`, type:'warning'});
+            return;
+          }
+        }
+      }
     }catch(e){
-      console.log('[START-GAME] check min players error', e.message);
+      console.log('[START-GAME] check host/ready error', e.message);
     }
 
     await supabase.from('rooms').update({status:'counting'}).eq('id',roomId);
@@ -1154,20 +1230,194 @@ io.on('connection', (socket)=>{
                 const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
         io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId, audioMode: currentRoomAudioMode});
 
-        // Kiểm tra thắng - FIX: BAO GỒM CẢ BOT - bot thắng cũng trừ tiền người chơi như người thật
-        let winnerFound = null;
-        let winnerInfo = null;
+        // ==== NEW: LOGIC CHIA ĐỀU KHI NHIỀU NGƯỜI CÙNG WIN ====
+        // Tìm TẤT CẢ người thắng (không chỉ người đầu tiên)
+        let winnersFound = [];
         for(const p of game.players){
-          // KHÔNG skip bot nữa - bot cũng được tính thắng để trừ tiền người chơi
+          // Với phòng riêng (không bot), chỉ tính người thật. Với phòng solo, tính cả bot để trừ tiền
+          // Nhưng để chia pot, chỉ chia cho người thật thắng cùng lúc
+          if(p.is_bot) continue; // bot không được chia pot, chỉ dùng để tính thua
           const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
           if(winInfo){
-            winnerFound = p;
-            winnerInfo = winInfo;
-            break;
+            winnersFound.push({player: p, winInfo});
+          }
+        }
+        // Nếu không có người thật thắng, kiểm tra bot thắng (để trừ tiền)
+        let botWinners = [];
+        if(winnersFound.length===0){
+          for(const p of game.players){
+            if(!p.is_bot) continue;
+            const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
+            if(winInfo){
+              botWinners.push({player: p, winInfo});
+            }
           }
         }
 
-        if(winnerFound){
+        // Nếu có người thắng (thật)
+        if(winnersFound.length>0){
+          // CÓ NGƯỜI THẮNG - CHIA ĐỀU POT
+          console.log(`[WIN DETECTED - MULTI] ${roomId} - ${winnersFound.length} winners with number ${num}: ${winnersFound.map(w=>w.player.user_id).join(', ')}`);
+          game.isDrawing = false;
+          game.pendingWin = {
+            winners: winnersFound,
+            winningNumber: num,
+            drawn: [...game.drawn],
+            roomData,
+            drawIndex: game.drawn.length - 1
+          };
+          game.waitingForAcks = true;
+          
+          io.to(roomId).emit('win-pending', {
+            roomId,
+            winningNumber: num,
+            winnerId: winnersFound[0].player.user_id,
+            winners: winnersFound.map(w=>({user_id:w.player.user_id, username:w.player.username})),
+            drawIndex: game.drawn.length - 1,
+            message: winnersFound.length>1 ? `Có ${winnersFound.length} người cùng thắng với số ${num}, chờ tất cả máy quay xong...` : `Có người thắng với số ${num}, chờ tất cả máy quay xong...`
+          });
+
+          let waitedForWin = 0;
+          const winCheckInterval = 300;
+          const maxWinWait = 15000;
+          
+          const checkWinSync = setInterval(async ()=>{
+            waitedForWin += winCheckInterval;
+            const got = game.clientAcks.size;
+            const expected = Math.max(1, game.expectedAcks || 1);
+            const allAcked = got >= expected;
+            const timedOut = waitedForWin >= maxWinWait;
+
+            if(waitedForWin % 1500 < winCheckInterval){
+              console.log(`[WIN SYNC WAIT] ${roomId} - Winning number ${num} - Got ${got}/${expected} acks, waited ${waitedForWin}ms`);
+              io.to(roomId).emit('sync-waiting', {
+                roomId,
+                drawIndex: game.currentDrawIndex,
+                number: num,
+                got,
+                expected,
+                waited,
+                need: expected - got,
+                isWinningNumber: true,
+                message: `Số thắng ${num} - đang chờ ${expected - got} máy quay xong`
+              });
+            }
+
+            if(allAcked || timedOut){
+              clearInterval(checkWinSync);
+              if(timedOut){
+                console.log(`[WIN SYNC TIMEOUT] ${roomId} - Only ${got}/${expected} acks for winning number ${num} after ${waitedForWin}ms, forcing game-won`);
+              } else {
+                console.log(`[WIN SYNC OK] ${roomId} - All ${got}/${expected} clients finished winning number ${num}, now emitting game-won`);
+              }
+
+              if(game.timeout) clearTimeout(game.timeout);
+              
+              const bet = roomData.bet_amount;
+              const feePercent = roomData.fee_percent;
+              const originalCount = game.originalPlayers ? game.originalPlayers.length : game.players.filter(pl=>!pl.is_bot).length;
+              const forfeitedCount = game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
+              const totalPlayersForPot = Math.max(game.players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
+              const totalPot = totalPlayersForPot * bet;
+              const fee = Math.floor(totalPot * feePercent / 100);
+              const netPot = totalPot - fee;
+              // CHIA ĐỀU
+              const share = Math.floor(netPot / winnersFound.length);
+              let remainder = netPot - share * winnersFound.length;
+
+              console.log(`[POT SPLIT] ${roomId} - totalPot=${totalPot} fee=${fee} net=${netPot} winners=${winnersFound.length} share=${share} remainder=${remainder}`);
+
+              // Trừ tiền những người thua (không phải winner)
+              for(const pl of game.players){
+                if(pl.is_bot) continue;
+                if(winnersFound.some(w=>w.player.id===pl.id || w.player.user_id===pl.user_id)) continue;
+                const alreadyForfeited = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
+                if(alreadyForfeited) continue;
+                const prof = await getProfileById(pl.user_id);
+                if(!prof) continue;
+                const isDemoPlayer = pl.is_demo;
+                if(isDemoPlayer){
+                  const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
+                  await supabase.from('profiles').update({
+                    demo_balance: newDemo,
+                    total_wagered: (prof.total_wagered || 0) + bet
+                  }).eq('id', pl.user_id);
+                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo - chia pot cho ${winnersFound.length} người thắng`}]);
+                } else {
+                  const newBal = (prof.balance || 0) - bet;
+                  await supabase.from('profiles').update({
+                    balance: newBal,
+                    total_wagered: (prof.total_wagered || 0) + bet
+                  }).eq('id', pl.user_id);
+                  await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose', amount: -bet, room_id:roomId, description: `Thua ${bet} - chia pot cho ${winnersFound.length} người thắng`}]);
+                }
+              }
+
+              // Cộng tiền cho từng người thắng (chia đều)
+              for(let i=0;i<winnersFound.length;i++){
+                const {player: p} = winnersFound[i];
+                const amount = share + (i===0 ? remainder : 0);
+                const winnerProf = await getProfileById(p.user_id);
+                if(winnerProf){
+                  const isDemoWinner = p.is_demo;
+                  if(isDemoWinner){
+                    const newDemo = (winnerProf.demo_balance || 0) + amount;
+                    await supabase.from('profiles').update({
+                      demo_balance: newDemo,
+                      total_wagered: (winnerProf.total_wagered || 0) + bet
+                    }).eq('id', p.user_id);
+                    await supabase.from('transactions').insert([{user_id: p.user_id, type:'win_demo', amount: amount, room_id:roomId, description: `Thắng ${amount} demo - chia đều ${winnersFound.length} người cùng thắng số ${num}`}]);
+                  } else {
+                    await supabase.from('profiles').update({
+                      balance: (winnerProf.balance || 0) + amount,
+                      total_wagered: (winnerProf.total_wagered || 0) + bet
+                    }).eq('id', p.user_id);
+                    await supabase.from('transactions').insert([{user_id: p.user_id, type:'win', amount: amount, room_id:roomId, description: `Thắng ${amount} - chia đều ${winnersFound.length} người cùng thắng số ${num}`}]);
+                  }
+                }
+              }
+
+              await supabase.from('rooms').update({status:'finished', winner_id: winnersFound[0].player.user_id || null}).eq('id',roomId);
+              
+              activeGames.delete(roomId);
+              roomReadyStates.delete(roomId);
+              
+              io.to(roomId).emit('game-won', {
+                winners: winnersFound.map(w=>w.player),
+                winner: winnersFound[0].player,
+                number: num, 
+                drawn: [...game.drawn], 
+                winningRow: winnersFound[0].winInfo.row, 
+                winningNumbers: winnersFound[0].winInfo.numbers, 
+                winAmount: share, 
+                share,
+                fee, 
+                totalPot, 
+                netPot,
+                reason:'bingo', 
+                forfeitedAmount: game.forfeitedAmount || 0, 
+                isDemoWin: winnersFound[0].player.is_demo,
+                finalSpinCompleted: true,
+                winnersCount: winnersFound.length
+              });
+
+              io.to(roomId).emit('game-finished-can-restart', {
+                roomId,
+                canRestart: true,
+                message: winnersFound.length>1 ? `Có ${winnersFound.length} người cùng thắng, pot chia đều!` : 'Ván kết thúc, có thể bắt đầu lại'
+              });
+              io.to(roomId).emit('room-status', {status:'waiting'});
+            }
+          }, winCheckInterval);
+          
+          return;
+        }
+
+        // Nếu chỉ có bot thắng (không có người thật thắng)
+        if(botWinners.length>0 && winnersFound.length===0){
+          let winnerFound = botWinners[0].player;
+          let winnerInfo = botWinners[0].winInfo;
+
           // CÓ NGƯỜI THẮNG - KHÔNG DỪNG NGAY, CHỜ TẤT CẢ MÁY QUAY XONG SỐ CUỐI
           const p = winnerFound;
           const winInfo = winnerInfo;
@@ -1535,15 +1785,37 @@ io.on('connection', (socket)=>{
     }
   });
   
-  // ===== AUDIO MODE SYNC: đồng bộ chế độ audio cho cả phòng (động) =====
+  // ===== AUDIO MODE SYNC: chỉ chủ phòng mới được đổi =====
   socket.on('change-audio-mode', ({roomId, mode, userId})=>{
     try{
       if(!roomId || !mode) return;
-      console.log(`[AUDIO MODE CHANGE] ${roomId} - Player ${userId} changed mode to ${mode}`);
-      roomAudioModes.set(roomId, mode);
-      const game = activeGames.get(roomId);
-      if(game) game.audioMode = mode;
-      io.to(roomId).emit('audio-mode-changed', {roomId, mode, userId});
+      // Check host
+      const hostId = roomHosts.get(roomId);
+      // Try get from DB if not in cache
+      supabase.from('rooms').select('host_id').eq('id', roomId).single().then(({data})=>{
+        const realHostId = data ? data.host_id : hostId;
+        if(realHostId && userId && realHostId !== userId){
+          console.log(`[AUDIO BLOCKED] ${roomId} - ${userId} not host (${realHostId}) tried to change audio`);
+          socket.emit('error', 'Chỉ chủ phòng mới được đổi chế độ âm thanh');
+          return;
+        }
+        console.log(`[AUDIO MODE CHANGE] ${roomId} - Host ${userId} changed mode to ${mode}`);
+        roomAudioModes.set(roomId, mode);
+        const game = activeGames.get(roomId);
+        if(game) game.audioMode = mode;
+        io.to(roomId).emit('audio-mode-changed', {roomId, mode, userId});
+      }).catch(()=>{
+        // fallback if DB check fails
+        if(hostId && userId && hostId !== userId){
+          console.log(`[AUDIO BLOCKED] ${roomId} - ${userId} not host (${hostId})`);
+          return socket.emit('error', 'Chỉ chủ phòng mới được đổi chế độ âm thanh');
+        }
+        console.log(`[AUDIO MODE CHANGE] ${roomId} - Player ${userId} changed mode to ${mode}`);
+        roomAudioModes.set(roomId, mode);
+        const game = activeGames.get(roomId);
+        if(game) game.audioMode = mode;
+        io.to(roomId).emit('audio-mode-changed', {roomId, mode, userId});
+      });
     }catch(e){ console.log('change-audio-mode err', e.message); }
   });
 
@@ -1553,6 +1825,108 @@ io.on('connection', (socket)=>{
       socket.emit('room-audio-mode', {roomId, mode});
     }catch(e){}
   });
+
+  // ==== NEW: TOGGLE READY - chỉ guest, host không cần ready ====
+  socket.on('toggle-ready', async ({roomId, userId, isReady})=>{
+    try{
+      if(!roomId || !userId) return;
+      const {data: room} = await supabase.from('rooms').select('host_id').eq('id', roomId).single();
+      const hostId = room ? room.host_id : roomHosts.get(roomId);
+      if(hostId && hostId === userId){
+        return socket.emit('error', 'Chủ phòng không cần sẵn sàng');
+      }
+      const game = activeGames.get(roomId);
+      if(game && game.isDrawing){
+        return socket.emit('error', 'Phòng đang chơi, không thể đổi trạng thái sẵn sàng');
+      }
+      if(!roomReadyStates.has(roomId)){
+        roomReadyStates.set(roomId, new Map());
+      }
+      const readyMap = roomReadyStates.get(roomId);
+      readyMap.set(userId, !!isReady);
+      console.log(`[READY] ${roomId} - ${userId} isReady=${isReady}`);
+
+      // Lấy username
+      let username = userId.slice(0,6);
+      try{
+        const {data: player} = await supabase.from('room_players').select('username').eq('room_id', roomId).eq('user_id', userId).maybeSingle();
+        if(player && player.username) username = player.username;
+        else {
+          const uname = await getUsernameById(userId);
+          if(uname) username = uname;
+        }
+      }catch(e){}
+
+      io.to(roomId).emit('ready-update', {roomId, userId, username, isReady: !!isReady});
+      // Emit lại players-update với isReady
+      const {data: players} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+      const playersWithReady = (players||[]).map(p=>{
+        const rMap = roomReadyStates.get(roomId);
+        const r = rMap ? !!rMap.get(p.user_id) : false;
+        return {...p, isReady: r};
+      });
+      io.to(roomId).emit('players-update', playersWithReady);
+    }catch(e){ console.log('toggle-ready error', e.message); }
+  });
+
+  // ==== NEW: CHANGE TICKET - đổi vé khác không cần rời phòng ====
+  socket.on('change-ticket', async ({roomId, userId, ticket, ticketColor, isDemo})=>{
+    try{
+      if(!roomId || !userId || !ticket) return socket.emit('error','Thiếu thông tin vé');
+      const game = activeGames.get(roomId);
+      if(game && game.isDrawing){
+        return socket.emit('error','Phòng đang quay, không thể đổi vé');
+      }
+      // Check trùng vé
+      const {data: allPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+      const isTaken = (allPlayers||[]).some(p=> p.user_id !== userId && JSON.stringify(p.ticket) === JSON.stringify(ticket));
+      if(isTaken){
+        return socket.emit('error','Vé đã được người khác chọn, hãy chọn vé khác');
+      }
+      // Update DB
+      const {data: updated, error} = await supabase.from('room_players').update({ticket, ticket_color: ticketColor, is_demo: !!isDemo}).eq('room_id', roomId).eq('user_id', userId).select().single();
+      if(error){
+        console.log('change-ticket DB error', error.message);
+        return socket.emit('error','Không thể đổi vé: '+error.message);
+      }
+      // Reset ready khi đổi vé
+      if(roomReadyStates.has(roomId)){
+        roomReadyStates.get(roomId).set(userId, false);
+      }
+      let username = userId.slice(0,6);
+      try{
+        if(updated && updated.username) username = updated.username;
+        else {
+          const uname = await getUsernameById(userId);
+          if(uname) username = uname;
+        }
+      }catch(e){}
+
+      console.log(`[TICKET CHANGED] ${roomId} - ${username} (${userId}) changed ticket`);
+
+      io.to(roomId).emit('ticket-changed', {
+        roomId,
+        userId,
+        username,
+        ticket,
+        ticketColor,
+        isDemo: !!isDemo
+      });
+
+      // Gửi lại danh sách players với ready reset
+      const {data: players} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+      const playersWithReady = (players||[]).map(p=>{
+        const rMap = roomReadyStates.get(roomId);
+        const r = rMap ? !!rMap.get(p.user_id) : false;
+        return {...p, isReady: r};
+      });
+      io.to(roomId).emit('players-update', playersWithReady);
+      io.to(roomId).emit('ready-update', {roomId, userId, username, isReady: false});
+
+    }catch(e){ console.log('change-ticket error', e.message); }
+  });
+
+
 
 socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
     console.warn(`[FALSE WIN] ${roomId} client báo win ảo ${winner?.username||winner?.user_id} - ${reason} - drawn ${drawnCount}`);

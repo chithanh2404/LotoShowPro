@@ -1097,6 +1097,7 @@ io.on('connection', (socket)=>{
       if(playersCheckErr) console.log('[START-GAME] fetch players error', playersCheckErr.message);
       const realPlayersCheck = (playersCheck||[]).filter(p=>!p.is_bot);
       const isSoloRoomCheck = roomId && roomId.startsWith('SOLO-');
+      // Chỉ check 2 người cho phòng riêng, solo thì bỏ qua
       if(!isSoloRoomCheck && realPlayersCheck.length < 2){
         console.log(`[BLOCKED] ${roomId} start blocked - only ${realPlayersCheck.length} real player(s), need 2`);
         io.to(roomId).emit('toast', {
@@ -1112,6 +1113,7 @@ io.on('connection', (socket)=>{
         await supabase.from('rooms').update({status:'waiting'}).eq('id', roomId);
         return;
       }
+
 
       // Kiểm tra tất cả non-host đã sẵn sàng chưa
       if(!isSoloRoomCheck){
@@ -1139,12 +1141,15 @@ io.on('connection', (socket)=>{
     setTimeout(async ()=>{
       // Check lại lần 2 ngay trước khi bắt đầu quay (tránh race khi có người out trong lúc đếm ngược)
       try{
-        const {data: playersRecheck} = await supabase.from('room_players').select('*').eq('room_id', roomId);
-        const realRecheck = (playersRecheck||[]).filter(p=>!p.is_bot);
+        const {data: playersRecheck} = await supabase.from('room_players').select('*').eq('id', roomId).limit(1);
+      }catch(e){}
+      try{
+        const {data: playersRecheck2} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+        const realRecheck = (playersRecheck2||[]).filter(p=>!p.is_bot);
         const isSoloRecheck = roomId && roomId.startsWith('SOLO-');
         if(!isSoloRecheck && realRecheck.length < 2){
           console.log(`[BLOCKED-COUNTDOWN] ${roomId} - not enough players after countdown (${realRecheck.length}/2)`);
-          io.to(roomId).emit('toast', {message:'❌ Không đủ 2 người, đã hủy bắt đầu! Mời thêm bạn vào.', type:'error'});
+          io.to(roomId).emit('toast', {message:'❌ Phòng riêng cần ít nhất 2 người, đã hủy bắt đầu! Mời thêm bạn vào.', type:'error'});
           await supabase.from('rooms').update({status:'waiting'}).eq('id', roomId);
           io.to(roomId).emit('game-cancelled', {reason:'not_enough_players', current: realRecheck.length});
           return;

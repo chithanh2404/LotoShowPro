@@ -1235,29 +1235,84 @@ io.on('connection', (socket)=>{
                 const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
         io.to(roomId).emit('number-drawn', {number:num, drawn: [...game.drawn], audioVariant, drawIndex: game.drawn.length-1, roomId, audioMode: currentRoomAudioMode});
 
-        // ==== NEW: LOGIC CHIA ĐỀU KHI NHIỀU NGƯỜI CÙNG WIN ====
-        // Tìm TẤT CẢ người thắng (không chỉ người đầu tiên)
+        // ==== LOGIC WIN MỚI: SOLO HÒA NẾU CẢ NGƯỜI + BOT CÙNG WIN ====
         let winnersFound = [];
-        for(const p of game.players){
-          // Với phòng riêng (không bot), chỉ tính người thật. Với phòng solo, tính cả bot để trừ tiền
-          // Nhưng để chia pot, chỉ chia cho người thật thắng cùng lúc
-          if(p.is_bot) continue; // bot không được chia pot, chỉ dùng để tính thua
-          const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
-          if(winInfo){
-            winnersFound.push({player: p, winInfo});
-          }
-        }
-        // Nếu không có người thật thắng, kiểm tra bot thắng (để trừ tiền)
         let botWinners = [];
-        if(winnersFound.length===0){
-          for(const p of game.players){
-            if(!p.is_bot) continue;
-            const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
-            if(winInfo){
-              botWinners.push({player: p, winInfo});
-            }
-          }
+        for(const p of game.players){
+          const winInfo = getWinningRowInfo(p.ticket, game.drawnSet);
+          if(!winInfo) continue;
+          if(p.is_bot) botWinners.push({player: p, winInfo});
+          else winnersFound.push({player: p, winInfo});
         }
+        const isSoloRoom = roomId && roomId.startsWith('SOLO-');
+
+        // === TRƯỜNG HỢP HÒA: SOLO mà cả người thật + bot cùng trúng 1 số ===
+        if(isSoloRoom && winnersFound.length>0 && botWinners.length>0){
+          console.log(`[DRAW - SOLO TIE] ${roomId} - Both real and bot win with number ${num}: real=${winnersFound.map(w=>w.player.user_id).join(',')} bot=${botWinners.map(w=>w.player.username).join(',')}`);
+          game.isDrawing = false;
+          game.pendingWin = null;
+          game.waitingForAcks = true;
+
+          io.to(roomId).emit('win-pending', {
+            roomId,
+            winningNumber: num,
+            isDraw: true,
+            winners: winnersFound.map(w=>({user_id:w.player.user_id, username:w.player.username})),
+            botWinners: botWinners.map(w=>({username:w.player.username})),
+            drawIndex: game.drawn.length - 1,
+            message: `Hòa! Bạn và bot cùng thắng với số ${num}, đang chờ hoàn tất...`
+          });
+
+          let waitedForWin = 0;
+          const winCheckInterval = 300;
+          const maxWinWait = 15000;
+          const checkWinSync = setInterval(async ()=>{
+            waitedForWin += winCheckInterval;
+            const got = game.clientAcks.size;
+            const expected = Math.max(1, game.expectedAcks || 1);
+            const allAcked = got >= expected;
+            const timedOut = waitedForWin >= maxWinWait;
+            if(allAcked || timedOut){
+              clearInterval(checkWinSync);
+              if(game.timeout) clearTimeout(game.timeout);
+              const bet = roomData.bet_amount;
+              // Hòa: hoàn tiền cho người thật (không thu phí, không thắng thua)
+              console.log(`[DRAW REFUND] ${roomId} - Refunding ${bet} to ${winnersFound.length} real players`);
+              for(const {player: p} of winnersFound){
+                // Không trừ không cộng, chỉ ghi log transaction hòa
+                const prof = await getProfileById(p.user_id);
+                if(prof){
+                  await supabase.from('transactions').insert([{user_id: p.user_id, type:'draw_refund', amount: 0, room_id: roomId, description: `Hòa với bot số ${num} - hoàn cược ${bet}`}]);
+                }
+              }
+              await supabase.from('rooms').update({status:'finished', winner_id: null}).eq('id',roomId);
+              activeGames.delete(roomId);
+              roomReadyStates.delete(roomId);
+              io.to(roomId).emit('game-draw', {
+                number: num,
+                drawn: [...game.drawn],
+                winners: winnersFound.map(w=>w.player),
+                botWinners: botWinners.map(w=>w.player),
+                reason: 'draw_both_win',
+                message: `Hòa! Bạn và bot cùng thắng với số ${num}`,
+                betRefunded: bet,
+                isDraw: true
+              });
+              io.to(roomId).emit('game-finished-can-restart', {
+                roomId,
+                canRestart: true,
+                isDraw: true,
+                message: `Hòa! Cùng thắng số ${num} - tiền cược được hoàn lại`
+              });
+              io.to(roomId).emit('room-status', {status:'waiting'});
+            }
+          }, winCheckInterval);
+          return;
+        }
+
+        // Nếu không hòa, tiếp tục logic cũ nhưng đã tính đủ botWinners
+        // (winnersFound và botWinners đã được tính ở trên)
+
 
         // Nếu có người thắng (thật)
         if(winnersFound.length>0){

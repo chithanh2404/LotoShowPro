@@ -1356,7 +1356,7 @@ io.on('connection', (socket)=>{
                 number: num,
                 got,
                 expected,
-                waited,
+                waited: waitedForWin,
                 need: expected - got,
                 isWinningNumber: true,
                 message: `Số thắng ${num} - đang chờ ${expected - got} máy quay xong`

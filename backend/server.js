@@ -1988,9 +1988,12 @@ io.on('connection', (socket)=>{
 
         // Nếu chưa ai thắng, CHỜ ĐỦ TẤT CẢ MÁY trong phòng báo audio xong mới quay tiếp
         // Cơ chế động: phòng có bao nhiêu máy chơi thì chờ đủ bấy nhiêu máy (2 máy=>2, 3 máy=>3, 5 máy=>5...)
+        // FIX SMART TIMEOUT: Nhạc Lô Tô ~30s, Giọng đọc ~2.5s
         let waited = 0;
         const checkInterval = 300;
-        const maxWaitTime = 20000; // 20s timeout an toàn nếu có máy disconnect
+        const audioModeForTimeout = game.audioMode || roomAudioModes.get(roomId) || "VOICE";
+        const isMusicMode = audioModeForTimeout === "MUSIC";
+        const maxWaitTime = isMusicMode ? 45000 : 12000; // MUSIC: 45s, VOICE: 12s
         const expectedPlayers = ()=> {
           try{
             // FIX: dùng expectedAcks đã được cập nhật động khi có người rời phòng (leave-room / disconnect)
@@ -2021,7 +2024,7 @@ io.on('connection', (socket)=>{
           
           // Log mỗi 1.5s để debug
           if(waited % 1500 < checkInterval){
-            console.log(`[SYNC WAIT] ${roomId} - Draw #${game.currentDrawIndex} (${game.drawn[game.drawn.length-1]}) - Got ${got}/${expected} audio-done acks, waited ${waited}ms, need ${expected - got} more`);
+            console.log(`[SYNC WAIT] ${roomId} - Draw #${game.currentDrawIndex} (${game.drawn[game.drawn.length-1]}) [${audioModeForTimeout}] - Got ${got}/${expected} audio-done acks, waited ${waited}ms/${maxWaitTime}ms, need ${expected - got} more`);
             // Gửi trạng thái chờ cho clients để hiển thị
             io.to(roomId).emit('sync-waiting', {
               roomId,

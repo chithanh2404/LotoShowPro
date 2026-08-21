@@ -2329,6 +2329,229 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
     }catch(e){ console.log('send-chat error', e.message); }
   });
 
+  // ===== PRIVATE MESSAGE: nhắn riêng trong phòng - ROBUST =====
+  socket.on('private-message', async ({roomId, fromUserId, fromUsername, toUserId, toUsername, text})=>{
+    try{
+      if(!fromUserId || !toUserId || !text) return;
+      const cleanText = text.toString().trim().slice(0,300);
+      if(!cleanText) return;
+      let senderName = fromUsername;
+      if(!senderName && fromUserId){
+        senderName = await getUsernameById(fromUserId);
+      }
+      let receiverName = toUsername;
+      if(!receiverName && toUserId){
+        receiverName = await getUsernameById(toUserId);
+      }
+      const effectiveRoomId = roomId || socket.data.roomId || 'unknown';
+      const msgData = {
+        roomId: effectiveRoomId,
+        fromUserId,
+        fromUsername: senderName,
+        toUserId,
+        toUsername: receiverName,
+        text: cleanText,
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'}),
+        messageId: Date.now() + '_' + fromUserId
+      };
+      
+      let delivered = 0;
+      const targetSockets = connectedUserSockets.get(toUserId);
+      if(targetSockets && targetSockets.size>0){
+        for(const sockId of targetSockets){
+          try{
+            const targetSocket = io.sockets.sockets.get(sockId);
+            if(targetSocket){
+              targetSocket.emit('private-message-received', msgData);
+              delivered++;
+            }
+          }catch(e){}
+        }
+      }
+      
+      if(delivered===0 && effectiveRoomId){
+        try{
+          const socketsInRoom = await io.in(effectiveRoomId).fetchSockets();
+          for(const s of socketsInRoom){
+            if(s.data && s.data.userId === toUserId){
+              io.to(s.id).emit('private-message-received', msgData);
+              delivered++;
+            }
+          }
+        }catch(e){ console.log('fetchSockets private error', e.message); }
+      }
+      
+      if(delivered===0){
+        try{
+          for(const [sid, sock] of io.sockets.sockets){
+            if(sock.data && sock.data.userId === toUserId){
+              sock.emit('private-message-received', msgData);
+              delivered++;
+            }
+          }
+        }catch(e){}
+      }
+      
+      socket.emit('private-message-sent', msgData);
+      console.log(`[PRIVATE] ${effectiveRoomId} ${fromUserId} (${senderName}) -> ${toUserId} (${receiverName}): ${cleanText.slice(0,30)} - delivered to ${delivered} sockets`);
+      
+      if(delivered===0){
+        socket.emit('error', 'Không tìm thấy người nhận (họ có thể đã rời phòng)');
+      }
+    }catch(e){ console.log('private-message error', e.message); }
+  });
+
+  // ===== FRIEND REQUEST: kết bạn trong phòng - ROBUST =====
+  socket.on('send-friend-request', async ({roomId, fromUserId, fromUsername, toUserId, toUsername})=>{
+    try{
+      if(!fromUserId || !toUserId) return;
+      if(fromUserId === toUserId) return socket.emit('error','Không thể kết bạn với chính mình');
+      
+      const key = toUserId + '_' + fromUserId;
+      if(pendingFriendRequests.has(key)){
+        return socket.emit('error','Đã gửi lời mời rồi, đang chờ phản hồi');
+      }
+      
+      let senderName = fromUsername;
+      if(!senderName && fromUserId){
+        senderName = await getUsernameById(fromUserId);
+      }
+      let receiverName = toUsername;
+      if(!receiverName && toUserId){
+        receiverName = await getUsernameById(toUserId);
+      }
+      
+      const effectiveRoomId = roomId || socket.data.roomId || 'unknown';
+      
+      const requestData = {
+        roomId: effectiveRoomId,
+        fromUserId,
+        fromUsername: senderName,
+        toUserId,
+        toUsername: receiverName,
+        timestamp: Date.now(),
+        requestId: key
+      };
+      
+      pendingFriendRequests.set(key, requestData);
+      
+      let delivered = 0;
+      const targetSockets = connectedUserSockets.get(toUserId);
+      if(targetSockets && targetSockets.size>0){
+        for(const sockId of targetSockets){
+          try{
+            const targetSocket = io.sockets.sockets.get(sockId);
+            if(targetSocket){
+              targetSocket.emit('friend-request-received', requestData);
+              delivered++;
+            }
+          }catch(e){}
+        }
+      }
+      
+      if(delivered===0 && effectiveRoomId){
+        try{
+          const socketsInRoom = await io.in(effectiveRoomId).fetchSockets();
+          for(const s of socketsInRoom){
+            if(s.data && s.data.userId === toUserId){
+              io.to(s.id).emit('friend-request-received', requestData);
+              delivered++;
+            }
+          }
+        }catch(e){}
+      }
+      
+      if(delivered===0){
+        try{
+          for(const [sid, sock] of io.sockets.sockets){
+            if(sock.data && sock.data.userId === toUserId){
+              sock.emit('friend-request-received', requestData);
+              delivered++;
+            }
+          }
+        }catch(e){}
+      }
+      
+      socket.emit('friend-request-sent', requestData);
+      console.log(`[FRIEND-REQ] ${effectiveRoomId} ${fromUserId} -> ${toUserId} delivered:${delivered}`);
+      
+      if(delivered===0){
+        socket.emit('error', 'Không tìm thấy người nhận (họ có thể đã rời phòng)');
+      }
+      
+      setTimeout(()=>{
+        pendingFriendRequests.delete(key);
+      }, 300000);
+      
+    }catch(e){ console.log('friend-request error', e.message); }
+  });
+
+  socket.on('friend-request-response', async ({roomId, requestId, fromUserId, toUserId, action})=>{
+    try{
+      if(!requestId || !action) return;
+      const reqData = pendingFriendRequests.get(requestId);
+      if(!reqData) return;
+      
+      const responseData = {
+        roomId: roomId || reqData.roomId,
+        requestId,
+        fromUserId: reqData.fromUserId,
+        fromUsername: reqData.fromUsername,
+        toUserId: reqData.toUserId,
+        toUsername: reqData.toUsername,
+        action,
+        timestamp: Date.now()
+      };
+      
+      if(action === 'accept'){
+        try{
+          await supabase.from('friends').insert({
+            user_id: reqData.fromUserId,
+            friend_id: reqData.toUserId,
+            status: 'accepted'
+          });
+          await supabase.from('friends').insert({
+            user_id: reqData.toUserId,
+            friend_id: reqData.fromUserId,
+            status: 'accepted'
+          });
+        }catch(e){ console.log('friend save error', e.message); }
+        pendingFriendRequests.delete(requestId);
+      }else if(action === 'decline'){
+        pendingFriendRequests.delete(requestId);
+      }
+      
+      const fromSockets = connectedUserSockets.get(reqData.fromUserId);
+      const toSockets = connectedUserSockets.get(reqData.toUserId);
+      
+      if(fromSockets){
+        for(const sockId of fromSockets){
+          try{
+            const s = io.sockets.sockets.get(sockId);
+            if(s) s.emit('friend-request-responded', responseData);
+          }catch(e){}
+        }
+      }
+      if(toSockets){
+        for(const sockId of toSockets){
+          try{
+            const s = io.sockets.sockets.get(sockId);
+            if(s) s.emit('friend-request-responded', responseData);
+          }catch(e){}
+        }
+      }
+      
+      // Fallback broadcast to room
+      try{
+        if(reqData.roomId){
+          io.to(reqData.roomId).emit('friend-request-responded', responseData);
+        }
+      }catch(e){}
+      
+      console.log(`[FRIEND-RESP] ${requestId} -> ${action}`);
+    }catch(e){ console.log('friend-response error', e.message); }
+  });
+
   socket.on('leave-room', async ({roomId, userId, username})=>{
     try{
       if(roomId) socket.leave(roomId);

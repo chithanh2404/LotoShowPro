@@ -2401,6 +2401,68 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
     }catch(e){ console.log('private-message error', e.message); }
   });
 
+  // ===== PRIVATE MESSAGE READ RECEIPT: đã xem =====
+  socket.on('private-message-read', async ({roomId, readerId, readerUsername, senderId, messageIds})=>{
+    try{
+      if(!readerId || !senderId) return;
+      const effectiveRoomId = roomId || socket.data.roomId || 'unknown';
+      let readerName = readerUsername;
+      if(!readerName && readerId){
+        readerName = await getUsernameById(readerId);
+      }
+      
+      const readData = {
+        roomId: effectiveRoomId,
+        readerId,
+        readerUsername: readerName,
+        senderId,
+        messageIds: messageIds || [],
+        timestamp: Date.now(),
+        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'})
+      };
+      
+      // Gửi cho người gửi để hiện "Đã xem"
+      let delivered = 0;
+      const senderSockets = connectedUserSockets.get(senderId);
+      if(senderSockets && senderSockets.size>0){
+        for(const sockId of senderSockets){
+          try{
+            const targetSocket = io.sockets.sockets.get(sockId);
+            if(targetSocket){
+              targetSocket.emit('private-message-read-receipt', readData);
+              delivered++;
+            }
+          }catch(e){}
+        }
+      }
+      
+      if(delivered===0 && effectiveRoomId){
+        try{
+          const socketsInRoom = await io.in(effectiveRoomId).fetchSockets();
+          for(const s of socketsInRoom){
+            if(s.data && s.data.userId === senderId){
+              io.to(s.id).emit('private-message-read-receipt', readData);
+              delivered++;
+            }
+          }
+        }catch(e){}
+      }
+      
+      if(delivered===0){
+        try{
+          for(const [sid, sock] of io.sockets.sockets){
+            if(sock.data && sock.data.userId === senderId){
+              sock.emit('private-message-read-receipt', readData);
+              delivered++;
+            }
+          }
+        }catch(e){}
+      }
+      
+      console.log(`[READ RECEIPT] ${effectiveRoomId} ${readerId} đã xem tin nhắn của ${senderId} - delivered:${delivered}`);
+    }catch(e){ console.log('private-message-read error', e.message); }
+  });
+
   // ===== FRIEND REQUEST: kết bạn trong phòng - ROBUST =====
   socket.on('send-friend-request', async ({roomId, fromUserId, fromUsername, toUserId, toUsername})=>{
     try{

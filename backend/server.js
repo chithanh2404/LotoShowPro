@@ -976,7 +976,38 @@ async function finalizeForfeitAndKick(roomId, userId, username){
       return;
     }
 
+    const isSoloRoomFinal = roomId.startsWith('SOLO-');
     const betAmount = game ? game.roomData?.bet_amount : (roomNow ? roomNow.bet_amount : null);
+
+    // ===== SOLO: chỉ tính thua khi tự ý rời phòng, mất mạng quá 60s thì KHÔNG trừ tiền =====
+    if(isSoloRoomFinal){
+      console.log(`[RECONNECT FINAL SOLO] ${roomId} - ${userId} failed ${MAX_RECONNECT_ATTEMPTS} attempts in SOLO, NOT forfeiting, just pausing/refunding`);
+      reconnectingPlayers.delete(getReconnectKey(roomId, userId));
+      
+      // Nếu game đang pause vì mất mạng, giữ nguyên pause, không trừ tiền
+      // Chỉ xóa phòng hoặc để người chơi vào lại sau
+      if(game && game.isPausedForReconnect){
+        // Không trừ tiền, chỉ thông báo game tạm dừng chờ người chơi quay lại
+        io.to(roomId).emit('game-paused-reconnect', {
+          roomId,
+          userId,
+          username: username || 'Người chơi',
+          isSolo: true,
+          reason: 'solo_timeout_no_forfeit',
+          message: `⏸️ Solo vẫn tạm dừng vì bạn chưa kết nối lại sau ${MAX_RECONNECT_ATTEMPTS} lần. Quay lại để tiếp tục, không mất tiền.`
+        });
+        io.to(roomId).emit('toast', {message: `⏸️ Solo vẫn đang tạm dừng, bạn quay lại bất cứ lúc nào để tiếp tục, không bị trừ tiền.`, type:'info'});
+        // Không xóa room_players, để họ có thể rejoin sau 60s vẫn được
+        // Chỉ xóa timer, không finalize kick
+        return;
+      }
+      // Nếu game đã finished (bot thắng) thì tiền đã trừ rồi, không trừ thêm
+      // Nếu chưa finished, không trừ
+      await supabase.from('room_players').delete().eq('room_id', roomId).eq('user_id', userId).catch(()=>{});
+      io.to(roomId).emit('player-reconnect-failed', {userId, username: username || 'Người chơi', roomId, attempts: MAX_RECONNECT_ATTEMPTS, isSolo: true, message: `${username||'Người chơi'} rời solo sau ${MAX_RECONNECT_ATTEMPTS} lần mất mạng, không bị trừ tiền (chỉ trừ khi tự rời phòng).`});
+      return;
+    }
+
     console.log(`[RECONNECT FINAL] ${roomId} - ${userId} failed ${MAX_RECONNECT_ATTEMPTS} attempts, final forfeit & kick`);
     // xóa khỏi reconnect map
     reconnectingPlayers.delete(getReconnectKey(roomId, userId));
@@ -1177,6 +1208,19 @@ io.on('connection', (socket)=>{
           io.to(roomId).emit('player-reconnected', {userId, username: reconUsername, roomId, message: `✅ ${reconUsername} đã kết nối lại!`});
           io.to(roomId).emit('toast', {message: `✅ ${reconUsername} đã kết nối lại!`, type:'success'});
           io.to(roomId).emit('sync-waiting', {roomId, drawIndex: game.currentDrawIndex, got: game.clientAcks?game.clientAcks.size:0, expected: game.expectedAcks, need: Math.max(0, game.expectedAcks - (game.clientAcks?game.clientAcks.size:0))});
+          
+          // ===== SOLO RESUME: nếu game đang pause vì mất mạng thì tiếp tục quay =====
+          if(game.isPausedForReconnect){
+            console.log(`[RECONNECT RESUME SOLO] ${roomId} - Resuming paused solo game for ${userId}`);
+            game.isPausedForReconnect = false;
+            game.waitingForReconnect = false;
+            // Resume sau 1.5s
+            if(game.resumeDraw){
+              game.timeout = setTimeout(()=>{ try{ game.resumeDraw(); }catch(e){ console.log('resume draw error', e.message); } }, 1500);
+              io.to(roomId).emit('game-resumed-reconnect', {roomId, userId, username: reconUsername, message: `▶️ Game tiếp tục sau khi ${reconUsername} kết nối lại!`});
+              io.to(roomId).emit('toast', {message: `▶️ Solo tiếp tục quay!`, type:'success'});
+            }
+          }
           
           // ===== QUAN TRỌNG: gửi lại toàn bộ lịch sử quay trong thời gian mất mạng =====
           if(game.drawn && game.drawn.length>0){
@@ -1467,6 +1511,9 @@ io.on('connection', (socket)=>{
         waitingForAcks: false,
         timeout: null,
         interval: null,
+        syncCheckInterval: null,
+        isPausedForReconnect: false,
+        waitingForReconnect: false,
         audioSyncEnabled: true // Bật cơ chế chờ đồng bộ
       };
       console.log(`[GAME START] ${roomId} - ${realPlayers.length} players, expectedAcks=${gameState.expectedAcks}, audioSyncEnabled=true`);
@@ -2015,6 +2062,12 @@ io.on('connection', (socket)=>{
         };
         
         const checkSync = setInterval(()=>{
+          // Nếu game đang pause vì solo mất mạng thì không timeout, chờ reconnect
+          if(game.isPausedForReconnect){
+            return;
+          }
+          // Lưu để disconnect handler có thể clear khi pause solo
+          game.syncCheckInterval = checkSync;
           waited += checkInterval;
           const got = game.clientAcks.size;
           const expected = expectedPlayers();
@@ -2038,6 +2091,8 @@ io.on('connection', (socket)=>{
           
           if(allAcked){
             clearInterval(checkSync);
+            if(game.syncCheckInterval) { clearInterval(game.syncCheckInterval); game.syncCheckInterval = null; }
+            if(game.syncCheckInterval) { clearInterval(game.syncCheckInterval); game.syncCheckInterval = null; }
             console.log(`[SYNC OK] ${roomId} - All ${got}/${expected} players reported audio done for draw #${game.currentDrawIndex}, drawing next in 1.2s`);
             io.to(roomId).emit('sync-complete', {
               roomId,
@@ -2050,6 +2105,7 @@ io.on('connection', (socket)=>{
           } else if(timedOut){
             // Timeout an toàn: nếu 1 máy disconnect, vẫn cho tiếp tục
             clearInterval(checkSync);
+            if(game.syncCheckInterval) { clearInterval(game.syncCheckInterval); game.syncCheckInterval = null; }
             console.log(`[SYNC TIMEOUT] ${roomId} - Only ${got}/${expected} acks after ${waited}ms for draw #${game.currentDrawIndex}, forcing next draw (maybe player disconnected)`);
             io.to(roomId).emit('sync-timeout', {
               roomId,
@@ -2063,6 +2119,8 @@ io.on('connection', (socket)=>{
           }
         }, checkInterval);
       };
+      gameState.drawNext = drawNextWithSync;
+      gameState.resumeDraw = drawNextWithSync;
 
       drawNextWithSync();
 
@@ -2577,27 +2635,66 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         try{
           const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
           const realCount = remainingPlayers ? remainingPlayers.filter(p=>!p.is_bot).length : 1;
-          if(realCount > 1){
-            const newExpected = Math.max(1, realCount - 1);
-            if(!game._originalExpectedAcks) game._originalExpectedAcks = game.expectedAcks;
-            console.log(`[DISCONNECT SYNC] ${roomId} - ${userId} disconnected, expectedAcks ${game.expectedAcks} -> ${newExpected} (excluding disconnected)`);
-            game.expectedAcks = newExpected;
-          }
-          if(game.clientAcks && game.clientAcks.has(userId)){
-            game.clientAcks.delete(userId);
-          }
-          io.to(roomId).emit('sync-waiting', {
-            roomId,
-            drawIndex: game.currentDrawIndex,
-            number: game.drawn && game.drawn.length>0 ? game.drawn[game.drawn.length-1] : null,
-            got: game.clientAcks ? game.clientAcks.size : 0,
-            expected: game.expectedAcks,
-            need: Math.max(0, game.expectedAcks - (game.clientAcks ? game.clientAcks.size : 0)),
-            reconnecting: true,
-            disconnectedUserId: userId
-          });
-          if(game.waitingForAcks && game.clientAcks && game.clientAcks.size >= game.expectedAcks){
-            io.to(roomId).emit('sync-complete', {roomId, got: game.clientAcks.size, expected: game.expectedAcks, reason:'player_disconnected_enough'});
+          const isSoloRoom = roomId.startsWith('SOLO-') || realCount <= 1;
+          
+          if(isSoloRoom){
+            // ===== SOLO: TẠM DỪNG QUAY, không quay tiếp bằng timeout =====
+            console.log(`[DISCONNECT SOLO PAUSE] ${roomId} - Solo player ${userId} disconnected, pausing game`);
+            game.isPausedForReconnect = true;
+            game.waitingForReconnect = true;
+            // Clear các timer đang chạy để dừng quay
+            if(game.timeout){ clearTimeout(game.timeout); game.timeout = null; }
+            if(game.interval){ clearInterval(game.interval); game.interval = null; }
+            if(game.syncCheckInterval){ clearInterval(game.syncCheckInterval); game.syncCheckInterval = null; }
+            game.waitingForAcks = false;
+            
+            io.to(roomId).emit('game-paused-reconnect', {
+              roomId,
+              userId,
+              username: username || 'Người chơi',
+              isSolo: true,
+              drawnCount: game.drawn ? game.drawn.length : 0,
+              message: `⏸️ Game tạm dừng vì bạn mất kết nối. Đang chờ kết nối lại ${MAX_RECONNECT_ATTEMPTS}x${RECONNECT_GRACE_MS/1000}s...`,
+              reason: 'solo_disconnect_pause'
+            });
+            io.to(roomId).emit('sync-waiting', {
+              roomId,
+              drawIndex: game.currentDrawIndex,
+              number: game.drawn && game.drawn.length>0 ? game.drawn[game.drawn.length-1] : null,
+              got: 0,
+              expected: 1,
+              need: 0,
+              reconnecting: true,
+              isPaused: true,
+              isSolo: true,
+              disconnectedUserId: userId,
+              message: 'Tạm dừng chờ reconnect'
+            });
+            io.to(roomId).emit('toast', {message: `⏸️ Solo tạm dừng vì mất mạng, chờ reconnect ${MAX_RECONNECT_ATTEMPTS} lần...`, type:'warning'});
+          } else {
+            // Phòng nhiều người: giảm expectedAcks để không treo
+            if(realCount > 1){
+              const newExpected = Math.max(1, realCount - 1);
+              if(!game._originalExpectedAcks) game._originalExpectedAcks = game.expectedAcks;
+              console.log(`[DISCONNECT SYNC] ${roomId} - ${userId} disconnected, expectedAcks ${game.expectedAcks} -> ${newExpected} (excluding disconnected)`);
+              game.expectedAcks = newExpected;
+            }
+            if(game.clientAcks && game.clientAcks.has(userId)){
+              game.clientAcks.delete(userId);
+            }
+            io.to(roomId).emit('sync-waiting', {
+              roomId,
+              drawIndex: game.currentDrawIndex,
+              number: game.drawn && game.drawn.length>0 ? game.drawn[game.drawn.length-1] : null,
+              got: game.clientAcks ? game.clientAcks.size : 0,
+              expected: game.expectedAcks,
+              need: Math.max(0, game.expectedAcks - (game.clientAcks ? game.clientAcks.size : 0)),
+              reconnecting: true,
+              disconnectedUserId: userId
+            });
+            if(game.waitingForAcks && game.clientAcks && game.clientAcks.size >= game.expectedAcks){
+              io.to(roomId).emit('sync-complete', {roomId, got: game.clientAcks.size, expected: game.expectedAcks, reason:'player_disconnected_enough'});
+            }
           }
         }catch(e){ console.log('disconnect sync error', e.message); }
       }

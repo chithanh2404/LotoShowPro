@@ -2323,7 +2323,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         userId,
         username: chatUsername || 'Người chơi',
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'})
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
       };
       socket.to(roomId).emit('chat-message', chatData);
     }catch(e){ console.log('send-chat error', e.message); }
@@ -2351,7 +2351,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         toUserId,
         toUsername: receiverName,
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'}),
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'}),
         messageId: Date.now() + '_' + fromUserId
       };
       
@@ -2418,7 +2418,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         senderId,
         messageIds: messageIds || [],
         timestamp: Date.now(),
-        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit'})
+        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
       };
       
       // Gửi cho người gửi để hiện "Đã xem"

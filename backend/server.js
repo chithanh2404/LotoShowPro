@@ -771,26 +771,89 @@ app.get('/api/tickets/generate', (req,res)=>{
 });
 
 app.post('/api/rooms', async (req,res)=>{
-  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo} = req.body;
+  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo, gameId, gameName} = req.body;
+  const finalGameId = gameId || req.body.game_id || 'loto';
+  const finalGameName = gameName || finalGameId;
   const id = 'LOTO-'+nanoid(6).toUpperCase();
   const fee = 20;
-  const {data, error} = await supabase.from('rooms').insert({id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'}).select().single();
-  if(error) return res.status(500).json({error});
+  // Try to insert with game_id, if column doesn't exist, fallback without it
+  let insertData = {id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting', game_id: finalGameId, game_name: finalGameName};
+  let {data, error} = await supabase.from('rooms').insert(insertData).select().single();
+  if(error){
+    console.log('Insert with game_id failed, trying without:', error.message);
+    // Fallback without game_id columns
+    const {data: data2, error: error2} = await supabase.from('rooms').insert({id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'}).select().single();
+    if(error2) return res.status(500).json({error: error2});
+    data = data2;
+    data.game_id = finalGameId;
+    data.game_name = finalGameName;
+  }
   const finalTicket = ticket || generateLotoTicket();
   const username = await getUsernameById(hostId);
   const ticketColor = req.body.ticketColor || '#00d2ff';
   const is_demo = !!isDemo;
   await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
-  // Cache host
+  // Cache host and gameId
   roomHosts.set(id, hostId);
   roomReadyStates.set(id, new Map());
-  res.json(data);
+  // Store gameId in memory for activeGames
+  if(!global.roomGameMap) global.roomGameMap = new Map();
+  global.roomGameMap.set(id, {gameId: finalGameId, gameName: finalGameName});
+  res.json({...data, game_id: finalGameId, game_name: finalGameName, gameId: finalGameId});
 });
 
 app.get('/api/rooms', async (req,res)=>{
   try{
-    const {data: rooms, error} = await supabase.from('rooms').select('*').order('created_at', {ascending:false}).limit(100);
-    if(error) return res.status(500).json({error: error.message});
+    const {data: rooms, error} = await supabase.from('rooms').select('*').in('status',['waiting','playing']).order('created_at',{ascending:false}).limit(50);
+    if(error) return res.json({rooms:[]});
+    
+    // Get player counts and game info for each room
+    const enriched = await Promise.all((rooms||[]).map(async (room)=>{
+      try{
+        const {count} = await supabase.from('room_players').select('*',{count:'exact', head:true}).eq('room_id', room.id);
+        // Try to get gameId from room or from memory map
+        let gameId = room.game_id || room.gameId || 'loto';
+        let gameName = room.game_name || room.gameName || gameId;
+        if(global.roomGameMap && global.roomGameMap.has(room.id)){
+          const gm = global.roomGameMap.get(room.id);
+          gameId = gm.gameId || gameId;
+          gameName = gm.gameName || gameName;
+        }
+        // Get active game progress if playing
+        const activeGame = activeGames.get(room.id);
+        let progress = 0;
+        let drawnCount = 0;
+        let isPlaying = false;
+        if(activeGame){
+          isPlaying = true;
+          drawnCount = activeGame.currentIdx || 0;
+          progress = Math.round((drawnCount/90)*100);
+        }
+        
+        return {
+          ...room,
+          playerCount: count||0,
+          hasPassword: !!room.password,
+          has_password: !!room.password,
+          isPlaying: isPlaying || room.status==='playing',
+          progress: progress,
+          drawnCount: drawnCount,
+          gameId: gameId,
+          game_id: gameId,
+          gameName: gameName,
+          game_name: gameName
+        };
+      }catch(e){
+        return {...room, playerCount:0, hasPassword:!!room.password, gameId: room.game_id||'loto', game_id: room.game_id||'loto'};
+      }
+    }));
+    
+    res.json({rooms: enriched});
+  }catch(e){
+    console.log('/api/rooms error', e.message);
+    res.json({rooms:[]});
+  }
+});
     
     // Lọc phòng đang hoạt động (chưa finished hoặc finished trong 5 phút gần đây để vẫn hiện)
     const now = new Date();
@@ -2323,7 +2386,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         userId,
         username: chatUsername || 'Người chơi',
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
       };
       socket.to(roomId).emit('chat-message', chatData);
     }catch(e){ console.log('send-chat error', e.message); }
@@ -2351,7 +2414,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         toUserId,
         toUsername: receiverName,
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'}),
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'}),
         messageId: Date.now() + '_' + fromUserId
       };
       
@@ -2418,7 +2481,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         senderId,
         messageIds: messageIds || [],
         timestamp: Date.now(),
-        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
+        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
       };
       
       // Gửi cho người gửi để hiện "Đã xem"

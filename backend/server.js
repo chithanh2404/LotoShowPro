@@ -3154,6 +3154,136 @@ setInterval(cleanupEmptyRooms, 60*1000);
 setTimeout(cleanupEmptyRooms, 10000);
 
 
+
+// ===== MULTI-GAME API - Load games from Drive via Apps Script =====
+const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL_GAMES || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
+
+async function fetchFromAppsScript(action, params={}){
+  try{
+    const url = new URL(APPSCRIPT_GAMES_URL);
+    url.searchParams.set('action', action);
+    for(const [k,v] of Object.entries(params)){
+      url.searchParams.set(k, v);
+    }
+    console.log('[GAMES] Fetching from Apps Script:', url.toString().substring(0,150));
+    const resp = await fetch(url.toString());
+    const txt = await resp.text();
+    try{
+      return JSON.parse(txt);
+    }catch(e){
+      // If it's HTML directly
+      if(action==='get' || action==='html'){
+        return {ok:true, html:txt};
+      }
+      return {ok:false, error:'Invalid JSON: '+txt.substring(0,200)};
+    }
+  }catch(e){
+    console.error('[GAMES] Apps Script fetch error:', e.message);
+    return {ok:false, error:e.message};
+  }
+}
+
+// List all games
+app.get('/api/games', async (req,res)=>{
+  try{
+    // Built-in Loto luôn có
+    const builtinGames = [
+      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto truyền thống 90 số - Vé đỏ, chơi với bot hoặc phòng riêng', icon:'🎲', iconUrl:'', color:'#FFD700', bgGradient:'linear-gradient(135deg, #FFD700, #FFA500)', game_type:'loto', gameType:'loto', isBuiltIn:true, maxPlayers:10, version:'1.0', modifiedTime:new Date().toISOString()}
+    ];
+    
+    const result = await fetchFromAppsScript('list');
+    if(result && result.ok && result.games && result.games.length>0){
+      // Merge, đảm bảo Loto ở đầu
+      const hasLoto = result.games.some(g=>g.id==='loto' || g.game_type==='loto');
+      const allGames = hasLoto ? result.games : [...builtinGames, ...result.games];
+      res.json({ok:true, games:allGames, count:allGames.length, source:'appscript'});
+    }else{
+      // Fallback chỉ có Loto
+      res.json({ok:true, games:builtinGames, count:builtinGames.length, source:'builtin', warning: result ? result.error : 'No games from Apps Script'});
+    }
+  }catch(e){
+    console.error('/api/games error', e);
+    res.status(500).json({ok:false, error:e.message, games:[
+      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto 90 số', icon:'🎲', game_type:'loto', isBuiltIn:true}
+    ]});
+  }
+});
+
+// Get game info
+app.get('/api/games/:fileId/info', async (req,res)=>{
+  try{
+    const fileId = req.params.fileId;
+    if(fileId==='loto'){
+      return res.json({ok:true, game:{id:'loto', name:'Loto Online', isBuiltIn:true}});
+    }
+    const result = await fetchFromAppsScript('info', {fileId});
+    res.json(result);
+  }catch(e){
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
+// Get game HTML - quan trọng nhất để chơi game từ Drive
+app.get('/api/games/:fileId/html', async (req,res)=>{
+  try{
+    const fileId = req.params.fileId;
+    if(!fileId) return res.status(400).send('Missing fileId');
+    
+    if(fileId==='loto'){
+      return res.status(400).json({ok:false, error:'Loto is built-in, no HTML file'});
+    }
+    
+    console.log('[GAMES] Request HTML for fileId:', fileId);
+    const result = await fetchFromAppsScript('get', {fileId, format:'raw'});
+    
+    // Apps Script có thể trả về JSON bọc HTML hoặc HTML trực tiếp
+    let html = '';
+    if(result && result.html){
+      html = result.html;
+    }else if(typeof result === 'string' && result.includes('<')){
+      html = result;
+    }else if(result && result.ok===false && result.html){
+      html = result.html;
+    }else{
+      // Thử fetch trực tiếp với action=get không format
+      const directResult = await fetchFromAppsScript('get', {fileId});
+      if(directResult && directResult.html){
+        html = directResult.html;
+      }else if(typeof directResult === 'string' && directResult.includes('<')){
+        html = directResult;
+      }else{
+        return res.status(404).json({ok:false, error:'Game HTML not found', details: result});
+      }
+    }
+    
+    // Trả về HTML trực tiếp để iframe có thể load
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.send(html);
+    
+  }catch(e){
+    console.error('/api/games/:fileId/html error', e);
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
+app.get('/api/games/:fileId/download', async (req,res)=>{
+  try{
+    const fileId = req.params.fileId;
+    const result = await fetchFromAppsScript('get', {fileId});
+    if(result && result.html){
+      res.setHeader('Content-Disposition', 'attachment; filename="' + fileId + '.html"');
+      res.setHeader('Content-Type', 'text/html');
+      res.send(result.html);
+    }else{
+      res.status(404).json({ok:false, error:'File not found'});
+    }
+  }catch(e){
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
+
+
 app.get('/', (req,res)=> res.send('Loto Online Backend Running - Demo Balance + Withdraw + Admin System - Updated Demo Win Logic'));
 
 const PORT = process.env.PORT || 3000;

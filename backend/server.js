@@ -926,6 +926,8 @@ const activeGames = new Map();
 const roomAudioModes = new Map(); // audio mode sync
 const roomReadyStates = new Map(); // roomId -> Map(userId -> isReady)
 const roomHosts = new Map(); // roomId -> hostId cache
+const connectedUserSockets = new Map(); // userId -> Set(socketId) for private chat
+const pendingFriendRequests = new Map(); // key: toUserId_fromUserId -> request data
 // ===== RECONNECT GRACE - tự động thử lại 3 lần trước khi đá =====
 const reconnectingPlayers = new Map();
 const RECONNECT_GRACE_MS = 20000;
@@ -1118,6 +1120,11 @@ io.on('connection', (socket)=>{
     socket.join(roomId);
     socket.data.userId = userId;
     socket.data.roomId = roomId;
+    // Track for private chat
+    if(!connectedUserSockets.has(userId)){
+      connectedUserSockets.set(userId, new Set());
+    }
+    connectedUserSockets.get(userId).add(socket.id);
     const {data: existList} = await supabase.from('room_players').select('*').eq('room_id',roomId).eq('user_id',userId);
     // Kiểm tra giới hạn phòng - đã tăng từ 5 lên 10
     const {data: allPlayersCheck} = await supabase.from('room_players').select('id').eq('room_id',roomId);
@@ -1342,6 +1349,10 @@ io.on('connection', (socket)=>{
     socket.join(roomId);
     socket.data.userId = userId;
     socket.data.roomId = roomId;
+    if(!connectedUserSockets.has(userId)){
+      connectedUserSockets.set(userId, new Set());
+    }
+    connectedUserSockets.get(userId).add(socket.id);
     socket.emit('solo-created', {roomId, fee});
     const {data: players} = await supabase.from('room_players').select('*').eq('room_id',roomId);
     io.to(roomId).emit('players-update', players);
@@ -2322,6 +2333,12 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
     try{
       if(roomId) socket.leave(roomId);
       let leavingUserId = userId || socket.data.userId;
+      // Cleanup tracking
+      if(leavingUserId && connectedUserSockets.has(leavingUserId)){
+        const set = connectedUserSockets.get(leavingUserId);
+        set.delete(socket.id);
+        if(set.size===0) connectedUserSockets.delete(leavingUserId);
+      }
       let leavingRoomId = roomId || socket.data.roomId;
       let leavingUsername = username;
       if(!leavingUsername && leavingUserId){
@@ -2533,6 +2550,12 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
     try{
       const userId = socket.data.userId;
       const roomId = socket.data.roomId;
+      // Cleanup private chat tracking
+      if(userId && connectedUserSockets.has(userId)){
+        const set = connectedUserSockets.get(userId);
+        set.delete(socket.id);
+        if(set.size===0) connectedUserSockets.delete(userId);
+      }
       if(!userId || !roomId) return;
       
       const username = await getUsernameById(userId) || 'Người chơi';

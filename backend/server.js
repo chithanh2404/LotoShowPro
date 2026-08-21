@@ -1715,17 +1715,16 @@ io.on('connection', (socket)=>{
         const maxWaitTime = 20000; // 20s timeout an toàn nếu có máy disconnect
         const expectedPlayers = ()=> {
           try{
-            // Tính lại số người chơi thực còn lại trong phòng (động)
-            const currentReal = game.players ? game.players.filter(p=>!p.is_bot).length : 1;
-            // Nếu có người rời, cập nhật expectedAcks giảm xuống
-            const activeFromDB = game.forfeitedPlayers ? currentReal : currentReal;
-            const expected = Math.max(1, activeFromDB);
-            // Cập nhật lại expectedAcks để log chính xác
-            if(expected !== game.expectedAcks){
-              console.log(`[SYNC UPDATE] ${roomId} expectedAcks updated ${game.expectedAcks} -> ${expected} (players left)`);
-              game.expectedAcks = expected;
+            // FIX: dùng expectedAcks đã được cập nhật động khi có người rời phòng (leave-room / disconnect)
+            // game.players đã được cập nhật trong leave-room, nên nếu còn lệch thì đồng bộ lại
+            if(game.players){
+              const currentReal = game.players.filter(p=>!p.is_bot).length;
+              if(currentReal > 0 && currentReal !== game.expectedAcks){
+                console.log(`[SYNC UPDATE] ${roomId} expectedAcks ${game.expectedAcks} -> ${currentReal} (from game.players)`);
+                game.expectedAcks = Math.max(1, currentReal);
+              }
             }
-            return expected;
+            return Math.max(1, game.expectedAcks || 1);
           }catch(e){
             return Math.max(1, game.expectedAcks || 1);
           }
@@ -2095,6 +2094,54 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', leavingRoomId);
         io.to(leavingRoomId).emit('players-update', remainingPlayers);
 
+        // ===== FIX SYNC: khi rời phòng trong lúc đang quay, loại khỏi danh sách chờ audio =====
+        if(game){
+          try{
+            // cập nhật RAM players để vòng quay sau dùng danh sách mới
+            game.players = remainingPlayers ? [...remainingPlayers] : [];
+            // loại user rời khỏi ack set nếu đã ack trước đó (tránh treo đếm ack ảo)
+            if(game.clientAcks){
+              if(game.clientAcks.has(leavingUserId)) game.clientAcks.delete(leavingUserId);
+              // cũng xóa theo socket.id nếu trùng (phòng thủ)
+              if(game.clientAcks.has(leavingUserId.toString())) game.clientAcks.delete(leavingUserId.toString());
+            }
+            const stillReal = remainingPlayers ? remainingPlayers.filter(p=>!p.is_bot).length : 0;
+            if(stillReal === 0){
+              console.log(`[LEAVE SYNC] ${leavingRoomId} - No real players left after ${leavingUserId} left, clearing sync`);
+              game.expectedAcks = 0;
+              if(game.clientAcks) game.clientAcks.clear();
+              game.waitingForAcks = false;
+              io.to(leavingRoomId).emit('sync-complete', {roomId: leavingRoomId, reason:'no_real_players', got:0, expected:0});
+              io.to(leavingRoomId).emit('sync-waiting', {roomId: leavingRoomId, got:0, expected:0, need:0});
+            } else {
+              const newExpected = Math.max(1, stillReal);
+              if(newExpected !== game.expectedAcks){
+                console.log(`[LEAVE SYNC] ${leavingRoomId} - Player ${leavingUserId} (${leavingUsername}) left, expectedAcks ${game.expectedAcks} -> ${newExpected} (remaining real: ${stillReal})`);
+                game.expectedAcks = newExpected;
+              }
+              if(game.waitingForAcks){
+                io.to(leavingRoomId).emit('sync-waiting', {
+                  roomId: leavingRoomId,
+                  drawIndex: game.currentDrawIndex,
+                  number: game.drawn && game.drawn.length>0 ? game.drawn[game.drawn.length-1] : null,
+                  got: game.clientAcks ? game.clientAcks.size : 0,
+                  expected: game.expectedAcks,
+                  need: Math.max(0, game.expectedAcks - (game.clientAcks ? game.clientAcks.size : 0))
+                });
+                if(game.clientAcks && game.clientAcks.size >= game.expectedAcks){
+                  console.log(`[LEAVE SYNC] ${leavingRoomId} - After leave, enough acks ${game.clientAcks.size}/${game.expectedAcks}, will force next draw`);
+                  io.to(leavingRoomId).emit('sync-complete', {
+                    roomId: leavingRoomId,
+                    got: game.clientAcks.size,
+                    expected: game.expectedAcks,
+                    reason: 'player_left_enough'
+                  });
+                }
+              }
+            }
+          }catch(e){ console.log('[LEAVE SYNC] error', e.message); }
+        }
+
         // ===== FIX: NẾU PHÒNG TRỐNG -> XÓA LUÔN KHỎI DB =====
         if(!remainingPlayers || remainingPlayers.length === 0){
           const realRemaining = remainingPlayers ? remainingPlayers.filter(p=>!p.is_bot).length : 0;
@@ -2244,8 +2291,14 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
             console.log(`[DISCONNECT CLEANUP] Phòng ${roomId} trống -> đã xóa`);
           }
         }
-        // FIX 1913: tránh treo 0/1 khi chỉ còn bot
+        // FIX 1913 + FIX LEAVE: tránh treo khi người chơi rời
         if(game){
+          try{
+            game.players = remainingPlayers ? [...remainingPlayers] : [];
+            if(game.clientAcks){
+              if(game.clientAcks.has(userId)) game.clientAcks.delete(userId);
+            }
+          }catch(e){}
           const stillReal = remainingPlayers.filter(p=>!p.is_bot).length;
           if(stillReal === 0){
             console.log(`[PLAYER LEFT SYNC] ${roomId} - No real players left, clearing sync wait (was ${game.clientAcks.size}/${game.expectedAcks}) to avoid hang 0/1`);
@@ -2257,8 +2310,17 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
           } else if(stillReal >= 0 && stillReal !== game.expectedAcks){
             console.log(`[PLAYER LEFT SYNC] ${roomId} - Player left, expectedAcks ${game.expectedAcks} -> ${Math.max(1, stillReal)} (remaining real players: ${stillReal})`);
             game.expectedAcks = Math.max(1, stillReal);
+            io.to(roomId).emit('sync-waiting', {
+              roomId,
+              drawIndex: game.currentDrawIndex,
+              number: game.drawn && game.drawn.length>0 ? game.drawn[game.drawn.length-1] : null,
+              got: game.clientAcks ? game.clientAcks.size : 0,
+              expected: game.expectedAcks,
+              need: Math.max(0, game.expectedAcks - (game.clientAcks ? game.clientAcks.size : 0))
+            });
             if(game.waitingForAcks && game.clientAcks.size >= game.expectedAcks){
               console.log(`[SYNC UPDATE] ${roomId} - After player left, already have enough acks ${game.clientAcks.size}/${game.expectedAcks}, will proceed`);
+              io.to(roomId).emit('sync-complete', {roomId, got: game.clientAcks.size, expected: game.expectedAcks, reason: 'player_left_enough'});
             }
           }
         }

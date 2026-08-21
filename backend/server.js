@@ -926,6 +926,165 @@ const activeGames = new Map();
 const roomAudioModes = new Map(); // audio mode sync
 const roomReadyStates = new Map(); // roomId -> Map(userId -> isReady)
 const roomHosts = new Map(); // roomId -> hostId cache
+// ===== NEW: RECONNECT GRACE - tự động thử lại 3 lần trước khi đá =====
+const reconnectingPlayers = new Map(); // key `${roomId}:${userId}` -> {attempt, timer, username, roomId, userId, disconnectedAt, betAmount}
+const RECONNECT_GRACE_MS = 20000; // 20s mỗi lần thử
+const MAX_RECONNECT_ATTEMPTS = 3;
+
+function getReconnectKey(roomId, userId){ return `${roomId}:${userId}`; }
+
+async function finalizeForfeitAndKick(roomId, userId, username){
+  try{
+    // ===== KIỂM TRA TRƯỚC: nếu người này đã thắng trong lúc offline thì KHÔNG đá, giữ tiền thắng =====
+    const game = activeGames.get(roomId);
+    const {data: roomNow} = await supabase.from('rooms').select('*').eq('id', roomId).single().catch(()=>({data:null}));
+    
+    // Nếu phòng đã finished và winner chính là user này -> đã thắng khi offline, không forfeit
+    if(roomNow && roomNow.status==='finished' && roomNow.winner_id===userId){
+      console.log(`[RECONNECT FINAL] ${roomId} - ${userId} is WINNER while offline, NOT kicking, keeping win`);
+      reconnectingPlayers.delete(getReconnectKey(roomId, userId));
+      io.to(roomId).emit('player-reconnected', {userId, username: username || 'Người chơi', roomId, message: `🏆 ${username||'Người chơi'} đã thắng khi đang offline, tiền đã cộng!`});
+      io.to(roomId).emit('toast', {message: `🏆 ${username||'Người chơi'} thắng khi offline, tiền đã cộng dù không reconnect!`, type:'success'});
+      return;
+    }
+    // Nếu đang trong pendingWin và user này là winner -> cũng không đá, chờ win hoàn tất
+    if(game && game.pendingWin){
+      const winners = game.pendingWin.winners || [];
+      const isWinner = winners.some(w=> (w.player && w.player.user_id===userId) || w.user_id===userId);
+      if(isWinner){
+        console.log(`[RECONNECT FINAL] ${roomId} - ${userId} is PENDING WINNER, delaying forfeit until win completes`);
+        // Không xóa ngay, đợi thêm 1 lần grace nữa để win hoàn tất
+        const key = getReconnectKey(roomId, userId);
+        const entry = reconnectingPlayers.get(key);
+        if(entry){
+          // reset attempt để cho win có thời gian hoàn tất (thêm 20s)
+          entry.attempt = Math.max(0, entry.attempt -1);
+          scheduleReconnectCheck(roomId, userId, username);
+          return;
+        }
+      }
+    }
+    // Nếu game đã không còn (đã kết thúc và winner là người khác), thì bet của user này đã bị trừ khi có người thắng, không trừ thêm
+    if(!game && roomNow && roomNow.status==='finished'){
+      console.log(`[RECONNECT FINAL] ${roomId} - Game already finished, winner ${roomNow.winner_id}, user ${userId} is loser, already deducted via win logic, just cleaning`);
+      reconnectingPlayers.delete(getReconnectKey(roomId, userId));
+      await supabase.from('room_players').delete().eq('room_id', roomId).eq('user_id', userId);
+      io.to(roomId).emit('player-left', {userId, username: username || 'Người chơi', roomId, wasPlaying: true, forfeited: 0, reason:'reconnect_failed_finished'});
+      const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+      io.to(roomId).emit('players-update', remainingPlayers||[]);
+      io.to(roomId).emit('player-reconnect-failed', {userId, username: username || 'Người chơi', roomId, attempts: MAX_RECONNECT_ATTEMPTS, message: `${username||'Người chơi'} đã thua, game kết thúc khi đang offline.`});
+      return;
+    }
+
+    const betAmount = game ? game.roomData?.bet_amount : (roomNow ? roomNow.bet_amount : null);
+    console.log(`[RECONNECT FINAL] ${roomId} - ${userId} failed ${MAX_RECONNECT_ATTEMPTS} attempts, final forfeit & kick`);
+    // xóa khỏi reconnect map
+    reconnectingPlayers.delete(getReconnectKey(roomId, userId));
+
+    if(game && betAmount){
+      if(!game.forfeitedPlayers) game.forfeitedPlayers = [];
+      if(!game.forfeitedAmount) game.forfeitedAmount = 0;
+      const already = game.forfeitedPlayers.some(p=>p.user_id===userId);
+      if(!already){
+        try{
+          const prof = await getProfileById(userId);
+          if(prof){
+            const playerInGame = game.originalPlayers ? game.originalPlayers.find(pl=>pl.user_id===userId) : null;
+            const isDemo = playerInGame ? playerInGame.is_demo : false;
+            if(isDemo){
+              await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-betAmount), total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
+            } else {
+              if((prof.balance||0) >= betAmount){
+                await supabase.from('profiles').update({balance: prof.balance - betAmount, total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
+              }
+            }
+            await supabase.from('transactions').insert([{user_id: userId, type:'forfeit', amount: -betAmount, room_id: roomId, description: `Mất kết nối quá ${MAX_RECONNECT_ATTEMPTS} lần - mất cược`}]);
+            game.forfeitedPlayers.push({user_id: userId, username, bet: betAmount, is_demo: isDemo});
+            game.forfeitedAmount += betAmount;
+            io.to(roomId).emit('player-forfeited', {userId, username: username || 'Người chơi', forfeitedAmount: betAmount, totalForfeited: game.forfeitedAmount, isDemo: isDemo, reason:'reconnect_failed'});
+          }
+        }catch(e){ console.log('final forfeit error', e.message); }
+      }
+    }
+
+    await supabase.from('room_players').delete().eq('room_id', roomId).eq('user_id', userId);
+    io.to(roomId).emit('player-left', {userId, username: username || 'Người chơi', roomId, wasPlaying: !!(game && game.roomData && (game.roomData.status==='playing'||game.roomData.status==='counting')), forfeited: betAmount||0, reason:'reconnect_failed'});
+    const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+    io.to(roomId).emit('players-update', remainingPlayers||[]);
+
+    // cập nhật sync như leave-room
+    if(game){
+      try{
+        game.players = remainingPlayers ? [...remainingPlayers] : [];
+        if(game.clientAcks && game.clientAcks.has(userId)) game.clientAcks.delete(userId);
+        const stillReal = remainingPlayers ? remainingPlayers.filter(p=>!p.is_bot).length : 0;
+        if(stillReal===0){
+          game.expectedAcks = 0;
+          if(game.clientAcks) game.clientAcks.clear();
+          game.waitingForAcks = false;
+          io.to(roomId).emit('sync-complete', {roomId, reason:'no_real_players', got:0, expected:0});
+          io.to(roomId).emit('sync-waiting', {roomId, got:0, expected:0, need:0});
+        } else {
+          game.expectedAcks = Math.max(1, stillReal);
+          io.to(roomId).emit('sync-waiting', {roomId, drawIndex: game.currentDrawIndex, got: game.clientAcks?game.clientAcks.size:0, expected: game.expectedAcks, need: Math.max(0, game.expectedAcks - (game.clientAcks?game.clientAcks.size:0))});
+          if(game.waitingForAcks && game.clientAcks && game.clientAcks.size >= game.expectedAcks){
+            io.to(roomId).emit('sync-complete', {roomId, got: game.clientAcks.size, expected: game.expectedAcks, reason:'player_left_enough'});
+          }
+        }
+        // nếu còn 0 người -> xóa phòng
+        if(!remainingPlayers || remainingPlayers.length===0){
+          await supabase.from('rooms').delete().eq('id', roomId);
+          activeGames.delete(roomId);
+        }
+      }catch(e){ console.log('final kick sync error', e.message); }
+    } else {
+      // không có game, chỉ xóa phòng nếu trống
+      if(!remainingPlayers || remainingPlayers.length===0){
+        await supabase.from('rooms').delete().eq('id', roomId);
+        activeGames.delete(roomId);
+      }
+    }
+
+    io.to(roomId).emit('player-reconnect-failed', {userId, username: username || 'Người chơi', roomId, attempts: MAX_RECONNECT_ATTEMPTS, message: `${username||'Người chơi'} mất kết nối quá ${MAX_RECONNECT_ATTEMPTS} lần, đã rời phòng và mất cược.`});
+    io.to(roomId).emit('toast', {message: `💔 ${username||'Người chơi'} mất kết nối ${MAX_RECONNECT_ATTEMPTS} lần, đã bị loại khỏi phòng!`, type:'error'});
+  }catch(e){ console.log('finalizeForfeitAndKick error', e.message); }
+}
+
+function scheduleReconnectCheck(roomId, userId, username){
+  const key = getReconnectKey(roomId, userId);
+  const entry = reconnectingPlayers.get(key);
+  if(!entry) return;
+  // clear old timer
+  if(entry.timer) clearTimeout(entry.timer);
+
+  if(entry.attempt >= MAX_RECONNECT_ATTEMPTS){
+    finalizeForfeitAndKick(roomId, userId, username);
+    return;
+  }
+
+  entry.timer = setTimeout(async ()=>{
+    const still = reconnectingPlayers.get(key);
+    if(!still) return; // đã reconnect
+    console.log(`[RECONNECT] ${roomId} - ${userId} attempt ${still.attempt}/${MAX_RECONNECT_ATTEMPTS} timed out after ${RECONNECT_GRACE_MS}ms`);
+    still.attempt += 1;
+    if(still.attempt > MAX_RECONNECT_ATTEMPTS){
+      finalizeForfeitAndKick(roomId, userId, username);
+    } else {
+      io.to(roomId).emit('player-reconnecting', {
+        userId,
+        username: username || still.username || 'Người chơi',
+        roomId,
+        attempt: still.attempt,
+        maxAttempts: MAX_RECONNECT_ATTEMPTS,
+        message: `📡 ${username||'Người chơi'} mất kết nối, đang thử lại ${still.attempt}/${MAX_RECONNECT_ATTEMPTS}...`
+      });
+      io.to(roomId).emit('toast', {message: `📡 ${username||'Người chơi'} mất kết nối, thử lại ${still.attempt}/${MAX_RECONNECT_ATTEMPTS} (${RECONNECT_GRACE_MS/1000}s)...`, type:'warning'});
+      // schedule next attempt
+      scheduleReconnectCheck(roomId, userId, username);
+    }
+  }, RECONNECT_GRACE_MS);
+}
+
 
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
@@ -933,11 +1092,31 @@ io.on('connection', (socket)=>{
   socket.on('join-room', async ({roomId, userId, password, ticket, ticketColor, isDemo})=>{
     const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     if(!room) return socket.emit('error','Phòng không tồn tại');
-    // ==== NEW: CHẶN VÀO PHÒNG KHI ĐANG QUAY ====
-    const existingGame = activeGames.get(roomId);
-    if(room.status === 'playing' || room.status === 'counting' || (existingGame && existingGame.isDrawing)){
-      console.log(`[JOIN BLOCKED] ${roomId} - Room is playing/counting, blocking join for ${userId}`);
-      return socket.emit('join-blocked-playing', {roomId, message: 'Phòng đang quay số, vui lòng chờ ván sau!'});
+
+    // ===== NEW: RECONNECT - cho phép vào lại nếu đang trong grace period =====
+    const reconnectKey = getReconnectKey(roomId, userId);
+    const isReconnecting = reconnectingPlayers.has(reconnectKey);
+    let isRejoinAfterDisconnect = false;
+    if(isReconnecting){
+      console.log(`[RECONNECT] ${roomId} - ${userId} is reconnecting, allowing join during playing`);
+      const recEntry = reconnectingPlayers.get(reconnectKey);
+      if(recEntry && recEntry.timer) clearTimeout(recEntry.timer);
+      reconnectingPlayers.delete(reconnectKey);
+      isRejoinAfterDisconnect = true;
+      // sẽ tiếp tục join bên dưới, bỏ qua block playing
+    } else {
+      // ==== NEW: CHẶN VÀO PHÒNG KHI ĐANG QUAY (chỉ chặn người mới, không chặn reconnect) ====
+      const existingGame = activeGames.get(roomId);
+      if(room.status === 'playing' || room.status === 'counting' || (existingGame && existingGame.isDrawing)){
+        // kiểm tra xem user đã có trong phòng chưa (đã từng join trước đó) - nếu có thì cho reconnect
+        const {data: alreadyInRoom} = await supabase.from('room_players').select('id').eq('room_id', roomId).eq('user_id', userId).maybeSingle();
+        if(!alreadyInRoom){
+          console.log(`[JOIN BLOCKED] ${roomId} - Room is playing/counting, blocking join for ${userId}`);
+          return socket.emit('join-blocked-playing', {roomId, message: 'Phòng đang quay số, vui lòng chờ ván sau!'});
+        }
+        // nếu đã có trong phòng, cho phép re-join (tự reconnect)
+        isRejoinAfterDisconnect = true;
+      }
     }
     if(room.password && room.password!==password) return socket.emit('error','Sai mật khẩu phòng');
     socket.join(roomId);
@@ -980,6 +1159,111 @@ io.on('connection', (socket)=>{
       return {...p, isReady};
     });
     io.to(roomId).emit('players-update', playersWithReady);
+
+    // ===== RECONNECT SUCCESS - khôi phục sync nếu là reconnect =====
+    if(isRejoinAfterDisconnect){
+      try{
+        const game = activeGames.get(roomId);
+        const {data: allPlayersNow} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+        if(game){
+          // khôi phục game.players
+          game.players = allPlayersNow ? [...allPlayersNow] : [];
+          const realNow = allPlayersNow ? allPlayersNow.filter(p=>!p.is_bot).length : 1;
+          const restoredExpected = Math.max(1, realNow);
+          console.log(`[RECONNECT SUCCESS] ${roomId} - ${userId} reconnected, expectedAcks ${game.expectedAcks} -> ${restoredExpected}`);
+          game.expectedAcks = restoredExpected;
+          if(game._originalExpectedAcks) delete game._originalExpectedAcks;
+          const reconUsername = await getUsernameById(userId) || 'Người chơi';
+          io.to(roomId).emit('player-reconnected', {userId, username: reconUsername, roomId, message: `✅ ${reconUsername} đã kết nối lại!`});
+          io.to(roomId).emit('toast', {message: `✅ ${reconUsername} đã kết nối lại!`, type:'success'});
+          io.to(roomId).emit('sync-waiting', {roomId, drawIndex: game.currentDrawIndex, got: game.clientAcks?game.clientAcks.size:0, expected: game.expectedAcks, need: Math.max(0, game.expectedAcks - (game.clientAcks?game.clientAcks.size:0))});
+          
+          // ===== QUAN TRỌNG: gửi lại toàn bộ lịch sử quay trong thời gian mất mạng =====
+          if(game.drawn && game.drawn.length>0){
+            const currentRoomAudioMode = game.audioMode || roomAudioModes.get(roomId) || "MUSIC";
+            // Gửi full drawn để client đồng bộ lại tất cả số đã bỏ lỡ
+            socket.emit('reconnect-sync', {
+              roomId,
+              drawn: [...game.drawn],
+              currentNumber: game.drawn[game.drawn.length-1],
+              drawIndex: game.currentDrawIndex,
+              totalDrawn: game.drawn.length,
+              expected: game.expectedAcks,
+              isReconnect: true,
+              message: `📥 Đã bỏ lỡ ${game.drawn.length} số trong lúc mất kết nối, đang đồng bộ...`
+            });
+            // Vẫn gửi number-drawn cuối để tương thích cũ
+            socket.emit('number-drawn', {number: game.drawn[game.drawn.length-1], drawn: [...game.drawn], audioVariant: getAudioVariantForNumber(game.drawn[game.drawn.length-1], game.currentDrawIndex, roomId), drawIndex: game.currentDrawIndex, roomId, audioMode: currentRoomAudioMode, isReconnectSync: true});
+            
+            // Nếu trong lúc offline có người thắng (kể cả chính mình), gửi luôn trạng thái thắng
+            if(game.pendingWin){
+              const pw = game.pendingWin;
+              const winners = pw.winners || [];
+              const isWinnerSelf = winners.some(w=>w.player && w.player.user_id===userId);
+              socket.emit('win-pending', {
+                roomId,
+                winningNumber: pw.winningNumber,
+                winners: winners.map(w=>({user_id:w.player.user_id, username:w.player.username})),
+                drawIndex: pw.drawIndex,
+                isReconnect: true,
+                isWinnerSelf,
+                message: isWinnerSelf ? `🎉 Bạn đã thắng với số ${pw.winningNumber} trong lúc mất kết nối! Đang chờ hoàn tất...` : `Có người thắng với số ${pw.winningNumber} trong lúc bạn offline...`
+              });
+              if(isWinnerSelf){
+                socket.emit('toast', {message: `🎉 Bạn đã thắng số ${pw.winningNumber} ngay cả khi đang mất mạng!`, type:'success'});
+              }
+            }
+
+            // Nếu game đã kết thúc trong lúc offline (có winner), báo cho người reconnect biết kết quả
+            // Lấy từ rooms table
+            try{
+              const {data: roomNow} = await supabase.from('rooms').select('*').eq('id', roomId).single();
+              if(roomNow && roomNow.status==='finished' && roomNow.winner_id){
+                const winnerId = roomNow.winner_id;
+                const isSelfWinner = winnerId===userId;
+                if(isSelfWinner){
+                  // Lấy lại thông tin thắng từ transaction hoặc game cũ (nếu còn trong RAM)
+                  socket.emit('game-won-offline', {
+                    roomId,
+                    winnerId,
+                    isSelfWinner: true,
+                    winningNumber: game.drawn[game.drawn.length-1],
+                    drawn: [...game.drawn],
+                    message: `🏆 Bạn đã thắng trong lúc mất kết nối! Tiền thưởng đã cộng vào tài khoản.`,
+                    reason: 'won_while_offline'
+                  });
+                  socket.emit('toast', {message: `🏆 Bạn đã thắng trong lúc offline! Kiểm tra số dư nhé!`, type:'success'});
+                } else {
+                  socket.emit('game-ended-offline', {
+                    roomId,
+                    winnerId,
+                    isSelfWinner: false,
+                    message: `Trò chơi đã kết thúc trong lúc bạn offline. Người thắng: ${winnerId}`,
+                    reason: 'finished_while_offline'
+                  });
+                }
+              }
+            }catch(e){ console.log('check finished while offline error', e.message); }
+          }
+        } else {
+          // Game không còn trong RAM (có thể server restart hoặc đã finished), nhưng vẫn cho vào phòng waiting
+          const {data: roomNow} = await supabase.from('rooms').select('*').eq('id', roomId).single();
+          if(roomNow && roomNow.current_numbers && roomNow.current_numbers.length>0){
+            socket.emit('reconnect-sync', {
+              roomId,
+              drawn: [...roomNow.current_numbers],
+              currentNumber: roomNow.current_numbers[roomNow.current_numbers.length-1],
+              totalDrawn: roomNow.current_numbers.length,
+              isReconnect: true,
+              fromDB: true
+            });
+          }
+          const reconUsername = await getUsernameById(userId) || 'Người chơi';
+          io.to(roomId).emit('player-reconnected', {userId, username: reconUsername, roomId});
+        }
+      }catch(e){ console.log('reconnect restore error', e.message); }
+    }
+
     // Emit room-info with hostId and status
     const hostIdToSend = room.host_id || roomHosts.get(roomId) || null;
     io.to(roomId).emit('room-info', {...room, hostId: hostIdToSend, host_id: hostIdToSend, status: room.status || 'waiting', isPlaying: room.status==='playing'});
@@ -2244,168 +2528,86 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
     try{
       const userId = socket.data.userId;
       const roomId = socket.data.roomId;
-      if(userId && roomId){
-        const game = activeGames.get(roomId);
-        const isPlaying = game && game.roomData && (game.roomData.status === 'playing' || game.roomData.status === 'counting');
-        const betAmount = game ? game.roomData.bet_amount : null;
-        
-        if(isPlaying && betAmount){
-          if(!game.forfeitedPlayers) game.forfeitedPlayers = [];
-          if(!game.forfeitedAmount) game.forfeitedAmount = 0;
-          const alreadyForfeited = game.forfeitedPlayers.some(p => p.user_id === userId);
-          if(!alreadyForfeited){
-            try{
-              const prof = await getProfileById(userId);
-              if(prof){
-                const playerInGame = game.originalPlayers ? game.originalPlayers.find(pl => pl.user_id === userId) : null;
-                const isDemo = playerInGame ? playerInGame.is_demo : false;
-                if(isDemo){
-                  await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-betAmount), total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
-                } else {
-                  if((prof.balance||0) >= betAmount){
-                    await supabase.from('profiles').update({balance: prof.balance - betAmount, total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
-                  }
-                }
-                await supabase.from('transactions').insert([{user_id: userId, type:'forfeit', amount: -betAmount, room_id: roomId, description: `Mất kết nối khi đang quay - mất cược`}]);
-                const username = await getUsernameById(userId);
-                game.forfeitedPlayers.push({user_id: userId, username: username, bet: betAmount, is_demo: isDemo});
-                game.forfeitedAmount += betAmount;
-                io.to(roomId).emit('player-forfeited', {userId, username: username || 'Người chơi', forfeitedAmount: betAmount, totalForfeited: game.forfeitedAmount, isDemo});
-              }
-            }catch(e){ console.log('disconnect forfeit error', e.message); }
-          }
-        }
-        
-        const username = await getUsernameById(userId);
-        await supabase.from('room_players').delete().eq('room_id', roomId).eq('user_id', userId);
-        io.to(roomId).emit('player-left', {userId, username: username || 'Người chơi', roomId, wasPlaying: !!isPlaying});
-        const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
-        io.to(roomId).emit('players-update', remainingPlayers);
-
-        // ===== FIX: NẾU PHÒNG TRỐNG -> XÓA LUÔN KHỎI DB =====
-        if(!remainingPlayers || remainingPlayers.length === 0){
-          const realRemaining = remainingPlayers ? remainingPlayers.filter(p=>!p.is_bot).length : 0;
-          if(realRemaining === 0){
-            await supabase.from('rooms').delete().eq('id', roomId);
-            activeGames.delete(roomId);
-            console.log(`[DISCONNECT CLEANUP] Phòng ${roomId} trống -> đã xóa`);
-          }
-        }
-        // FIX 1913 + FIX LEAVE: tránh treo khi người chơi rời
-        if(game){
-          try{
-            game.players = remainingPlayers ? [...remainingPlayers] : [];
-            if(game.clientAcks){
-              if(game.clientAcks.has(userId)) game.clientAcks.delete(userId);
-            }
-          }catch(e){}
-          const stillReal = remainingPlayers.filter(p=>!p.is_bot).length;
-          if(stillReal === 0){
-            console.log(`[PLAYER LEFT SYNC] ${roomId} - No real players left, clearing sync wait (was ${game.clientAcks.size}/${game.expectedAcks}) to avoid hang 0/1`);
-            game.expectedAcks = 0;
-            if(game.clientAcks) game.clientAcks.clear();
-            game.waitingForAcks = false;
-            io.to(roomId).emit('sync-complete', {roomId, reason:'no_real_players', got:0, expected:0});
-            io.to(roomId).emit('sync-waiting', {roomId, got:0, expected:0, need:0});
-          } else if(stillReal >= 0 && stillReal !== game.expectedAcks){
-            console.log(`[PLAYER LEFT SYNC] ${roomId} - Player left, expectedAcks ${game.expectedAcks} -> ${Math.max(1, stillReal)} (remaining real players: ${stillReal})`);
-            game.expectedAcks = Math.max(1, stillReal);
-            io.to(roomId).emit('sync-waiting', {
-              roomId,
-              drawIndex: game.currentDrawIndex,
-              number: game.drawn && game.drawn.length>0 ? game.drawn[game.drawn.length-1] : null,
-              got: game.clientAcks ? game.clientAcks.size : 0,
-              expected: game.expectedAcks,
-              need: Math.max(0, game.expectedAcks - (game.clientAcks ? game.clientAcks.size : 0))
-            });
-            if(game.waitingForAcks && game.clientAcks.size >= game.expectedAcks){
-              console.log(`[SYNC UPDATE] ${roomId} - After player left, already have enough acks ${game.clientAcks.size}/${game.expectedAcks}, will proceed`);
-              io.to(roomId).emit('sync-complete', {roomId, got: game.clientAcks.size, expected: game.expectedAcks, reason: 'player_left_enough'});
-            }
-          }
-        }
-        if(game){
-          const stillInRoom = remainingPlayers.filter(p=>!p.is_bot);
-          if(stillInRoom.length === 0 && game.roomData && game.roomData.status !== 'finished'){
-            console.log(`[BOT ONLY] Room ${leavingRoomId || roomId} - No real players left, ending game to avoid sync hang 0/1`);
-            if(game.interval) clearInterval(game.interval);
-            if(game.timeout) clearTimeout(game.timeout);
-            if(game.clientAcks) game.clientAcks.clear();
-            game.waitingForAcks = false;
-            activeGames.delete(leavingRoomId || roomId);
-            try{
-              await supabase.from('rooms').update({status:'finished'}).eq('id', leavingRoomId || roomId);
-            }catch(e){}
-            io.to(leavingRoomId || roomId).emit('game-ended', {reason:'all_left', message:'Tất cả người chơi đã rời phòng'});
-            io.to(leavingRoomId || roomId).emit('sync-complete', {roomId: leavingRoomId || roomId, reason:'no_real_players', got:0, expected:0});
-            io.to(leavingRoomId || roomId).emit('room-closed', {roomId: leavingRoomId || roomId, reason:'no_players'});
-          } else if(stillInRoom.length === 1 && game.roomData && game.roomData.status !== 'finished'){
-            clearInterval(game.interval);
-            activeGames.delete(roomId);
-            const bet = game.roomData.bet_amount;
-            const feePercent = game.roomData.fee_percent;
-            const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + 1 + (game.forfeitedPlayers ? game.forfeitedPlayers.length : 0));
-            const totalPot = originalCount * bet;
-            const fee = Math.floor(totalPot * feePercent / 100);
-            const winAmount = totalPot - fee;
-            const winner = stillInRoom[0];
-            // UPDATED per new spec for disconnect last man
-            if(winner.is_demo){
-              for(const pl of game.originalPlayers){
-                if(pl.user_id && pl.user_id !== winner.user_id){
-                  const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
-                  if(!alreadyDeducted){
-                    const prof = await getProfileById(pl.user_id);
-                    if(prof){
-                      const demoBal = prof.demo_balance || 0;
-                      if(demoBal > 0){
-                        const deduct = Math.min(demoBal, bet);
-                        await supabase.from('profiles').update({demo_balance: Math.max(0, demoBal-deduct), total_wagered: (prof.total_wagered||0)+deduct}).eq('id',pl.user_id);
-                        await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit_demo', amount: -deduct, room_id: roomId, description: 'Thua demo last man disconnect'}]);
-                      } else {
-                        await supabase.from('profiles').update({total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
-                      }
-                    }
-                  }
-                }
-              }
-            } else {
-              for(const pl of game.originalPlayers){
-                if(pl.user_id && pl.user_id !== winner.user_id){
-                  const alreadyDeducted = game.forfeitedPlayers && game.forfeitedPlayers.some(fp => fp.user_id === pl.user_id);
-                  if(!alreadyDeducted){
-                    const prof = await getProfileById(pl.user_id);
-                    if(prof){
-                      if(pl.is_demo){
-                        await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-bet), total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
-                      } else {
-                        await supabase.from('profiles').update({balance: (prof.balance||0)-bet, total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
-                      }
-                      await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit', amount: -bet, room_id: roomId}]);
-                    }
-                  }
-                }
-              }
-            }
-            const winnerProf = await getProfileById(winner.user_id);
-            if(winnerProf){
-              if(winner.is_demo){
-                await supabase.from('profiles').update({demo_balance: (winnerProf.demo_balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);
-                await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win_demo', amount: winAmount, room_id:roomId, description: 'Thắng demo last man disconnect - người thua chỉ mất demo nếu có'}]);
-              } else {
-                await supabase.from('profiles').update({balance: (winnerProf.balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);
-                await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win', amount: winAmount, room_id:roomId}]);
-              }
-            }
-            await supabase.from('rooms').update({status:'finished', winner_id: winner.user_id}).eq('id',roomId);
-            io.to(roomId).emit('game-won', {winner, winAmount, fee, totalPot, reason:'last_man_standing', forfeitedAmount: game.forfeitedAmount || 0, isDemoWin: winner.is_demo});
-          }
-        }
+      if(!userId || !roomId) return;
+      
+      const username = await getUsernameById(userId) || 'Người chơi';
+      const game = activeGames.get(roomId);
+      const isPlaying = game && game.roomData && (game.roomData.status === 'playing' || game.roomData.status === 'counting');
+      
+      const key = getReconnectKey(roomId, userId);
+      if(reconnectingPlayers.has(key)){
+        console.log(`[DISCONNECT] ${roomId} - ${userId} already in reconnecting map, skip duplicate`);
+        return;
       }
+      
+      console.log(`[DISCONNECT] ${roomId} - ${userId} (${username}) disconnected, starting grace ${MAX_RECONNECT_ATTEMPTS}x${RECONNECT_GRACE_MS}ms, isPlaying=${!!isPlaying}`);
+      
+      // Lưu vào map reconnecting, chưa đá ngay
+      reconnectingPlayers.set(key, {
+        attempt: 1,
+        timer: null,
+        username,
+        roomId,
+        userId,
+        disconnectedAt: Date.now()
+      });
+      
+      io.to(roomId).emit('player-disconnected', {
+        userId,
+        username,
+        roomId,
+        attempt: 1,
+        maxAttempts: MAX_RECONNECT_ATTEMPTS,
+        graceMs: RECONNECT_GRACE_MS,
+        isPlaying: !!isPlaying,
+        message: `📡 ${username} mất kết nối, đang thử lại 1/${MAX_RECONNECT_ATTEMPTS}...`
+      });
+      io.to(roomId).emit('player-reconnecting', {
+        userId,
+        username,
+        roomId,
+        attempt: 1,
+        maxAttempts: MAX_RECONNECT_ATTEMPTS,
+        message: `📡 ${username} mất kết nối, đang thử lại 1/${MAX_RECONNECT_ATTEMPTS}...`
+      });
+      io.to(roomId).emit('toast', {message: `📡 ${username} mất kết nối, đang thử lại 1/${MAX_RECONNECT_ATTEMPTS} (${RECONNECT_GRACE_MS/1000}s)...`, type:'warning'});
+      
+      // Tạm thời giảm expectedAcks để game không treo chờ máy mất mạng
+      if(game){
+        try{
+          const {data: remainingPlayers} = await supabase.from('room_players').select('*').eq('room_id', roomId);
+          const realCount = remainingPlayers ? remainingPlayers.filter(p=>!p.is_bot).length : 1;
+          if(realCount > 1){
+            const newExpected = Math.max(1, realCount - 1);
+            if(!game._originalExpectedAcks) game._originalExpectedAcks = game.expectedAcks;
+            console.log(`[DISCONNECT SYNC] ${roomId} - ${userId} disconnected, expectedAcks ${game.expectedAcks} -> ${newExpected} (excluding disconnected)`);
+            game.expectedAcks = newExpected;
+          }
+          if(game.clientAcks && game.clientAcks.has(userId)){
+            game.clientAcks.delete(userId);
+          }
+          io.to(roomId).emit('sync-waiting', {
+            roomId,
+            drawIndex: game.currentDrawIndex,
+            number: game.drawn && game.drawn.length>0 ? game.drawn[game.drawn.length-1] : null,
+            got: game.clientAcks ? game.clientAcks.size : 0,
+            expected: game.expectedAcks,
+            need: Math.max(0, game.expectedAcks - (game.clientAcks ? game.clientAcks.size : 0)),
+            reconnecting: true,
+            disconnectedUserId: userId
+          });
+          if(game.waitingForAcks && game.clientAcks && game.clientAcks.size >= game.expectedAcks){
+            io.to(roomId).emit('sync-complete', {roomId, got: game.clientAcks.size, expected: game.expectedAcks, reason:'player_disconnected_enough'});
+          }
+        }catch(e){ console.log('disconnect sync error', e.message); }
+      }
+      
+      // Bắt đầu đếm 3 lần thử
+      scheduleReconnectCheck(roomId, userId, username);
+      
     }catch(e){ console.log('disconnect error', e.message); }
   });
 
-});
 
 
 // ===== AUTO CLEANUP: XÓA PHÒNG TRỐNG + PHÒNG CŨ KẸT =====

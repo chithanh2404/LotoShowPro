@@ -3122,7 +3122,7 @@ setTimeout(cleanupEmptyRooms, 10000);
 // ===== MULTI-GAME: API lấy danh sách game từ Apps Script hoặc fallback =====
 app.get('/api/games', async (req,res)=>{
   try{
-    const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL;
+    const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
     if(APPSCRIPT_GAMES_URL){
       try{
         // Try to fetch from Apps Script
@@ -3147,7 +3147,7 @@ app.get('/api/games', async (req,res)=>{
 app.get('/api/games/:gameId/html', async (req,res)=>{
   try{
     const {gameId} = req.params;
-    const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL;
+    const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
     if(!APPSCRIPT_GAMES_URL) return res.status(400).json({ok:false, error:'No APPSCRIPT_GAMES_URL configured'});
     const fetchUrl = APPSCRIPT_GAMES_URL + '?action=get&fileId=' + encodeURIComponent(gameId);
     const response = await fetch(fetchUrl);

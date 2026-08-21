@@ -615,6 +615,11 @@ app.get('/api/user/balance', async (req, res) => {
     if(!userId) return res.status(400).json({error: 'Thieu userId'});
 
 // ===== UNIFIED WALLET API FOR ALL GAMES (Caro, Tai Xiu, Bau Cua, Xoc Dia) - Dùng chung số dư thật và demo =====
+// GET for testing - so browser doesn't show Cannot GET
+app.get('/api/wallet/bet', (req,res)=>{
+  res.json({ok:false, error:'Use POST /api/wallet/bet with {userId, amount, mode}', method:'GET not allowed, use POST', example:{userId:'uuid', amount:10000, mode:'real'}});
+});
+
 app.post('/api/wallet/bet', async (req,res)=>{
   try{
     const {userId, amount, mode, gameId, gameType, description} = req.body;
@@ -652,6 +657,10 @@ app.post('/api/wallet/bet', async (req,res)=>{
   }catch(e){ console.error('/api/wallet/bet error', e); res.status(500).json({ok:false, error:e.message}); }
 });
 
+app.get('/api/wallet/win', (req,res)=>{
+  res.json({ok:false, error:'Use POST /api/wallet/win'});
+});
+
 app.post('/api/wallet/win', async (req,res)=>{
   try{
     const {userId, amount, mode, gameId, gameType, description, multiplier} = req.body;
@@ -684,6 +693,10 @@ app.post('/api/wallet/win', async (req,res)=>{
     console.log(`[WALLET] ${userId} win ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
     res.json({ok:true, newBalance, won: amt, mode: useDemo ? 'demo' : 'real', message:`Đã thắng ${amt.toLocaleString()} xu`});
   }catch(e){ console.error('/api/wallet/win error', e); res.status(500).json({ok:false, error:e.message}); }
+});
+
+app.get('/api/wallet', (req,res)=>{
+  res.json({ok:true, endpoints:['POST /api/wallet/bet','POST /api/wallet/win','GET /api/wallet/history','POST /api/wallet/switch-mode'], message:'Wallet API is running'});
 });
 
 app.get('/api/wallet/history', async (req,res)=>{

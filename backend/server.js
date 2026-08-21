@@ -771,141 +771,61 @@ app.get('/api/tickets/generate', (req,res)=>{
 });
 
 app.post('/api/rooms', async (req,res)=>{
-  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo, gameType, gameId, gameName} = req.body;
-  const gType = gameType || 'loto';
-  const prefix = gType === 'loto' ? 'LOTO-' : (gType.substring(0,4).toUpperCase()+'-');
-  const id = prefix + nanoid(6).toUpperCase();
+  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo} = req.body;
+  const id = 'LOTO-'+nanoid(6).toUpperCase();
   const fee = 20;
-  const roomData = {
-    id, 
-    name: name || (gameName ? gameName + ' #' + id.slice(-4) : 'Phòng ' + id), 
-    host_id:hostId, 
-    password: password||null, 
-    bet_amount:betAmount, 
-    max_players:maxPlayers||10, 
-    fee_percent:fee, 
-    status:'waiting'
-  };
-  // Try to include game columns if they exist (for multi-game support)
-  try{
-    roomData.game_type = gType;
-    roomData.game_id = gameId || null;
-    roomData.game_name = gameName || gType;
-  }catch(e){}
-  
-  let data, error;
-  try{
-    const result = await supabase.from('rooms').insert(roomData).select().single();
-    data = result.data;
-    error = result.error;
-  }catch(e){
-    // Fallback if columns don't exist yet
-    delete roomData.game_type;
-    delete roomData.game_id;
-    delete roomData.game_name;
-    const result = await supabase.from('rooms').insert(roomData).select().single();
-    data = result.data;
-    error = result.error;
-  }
-  
-  if(error){
-    // Try fallback without game columns if first attempt failed
-    if(error.message && error.message.includes('game_')){
-      const fallbackData = {id, name: roomData.name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'};
-      const result2 = await supabase.from('rooms').insert(fallbackData).select().single();
-      data = result2.data;
-      error = result2.error;
-      // Store game info in memory
-      if(data){
-        data.game_type = gType;
-        data.game_id = gameId;
-        data.game_name = gameName;
-      }
-    }
-    if(error) return res.status(500).json({error});
-  }
-  
-  const finalTicket = ticket || (gType === 'loto' ? generateLotoTicket() : null);
+  const {data, error} = await supabase.from('rooms').insert({id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'}).select().single();
+  if(error) return res.status(500).json({error});
+  const finalTicket = ticket || generateLotoTicket();
   const username = await getUsernameById(hostId);
   const ticketColor = req.body.ticketColor || '#00d2ff';
   const is_demo = !!isDemo;
-  
-  // For non-loto games, ticket can be null - game will handle its own player data
-  const playerInsert = {
-    room_id:id, 
-    user_id:hostId, 
-    username: username, 
-    ticket_color: ticketColor, 
-    is_bot:false, 
-    is_demo
-  };
-  if(finalTicket) playerInsert.ticket = finalTicket;
-  // Add game info to player if possible (for tracking)
-  try{
-    playerInsert.game_type = gType;
-  }catch(e){}
-  
-  try{
-    await supabase.from('room_players').insert(playerInsert);
-  }catch(e){
-    // Fallback without game_type
-    delete playerInsert.game_type;
-    await supabase.from('room_players').insert(playerInsert);
-  }
-  
-  // Cache host and game info
+  await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
+  // Cache host
   roomHosts.set(id, hostId);
   roomReadyStates.set(id, new Map());
-  // Store game info in activeGames placeholder for listing
-  if(!activeGames.has(id)){
-    activeGames.set(id, { roomData: data, gameType: gType, gameId, gameName, drawn: [], isDrawing: false });
-  }
-  
-  res.json({...data, game_type: gType, game_id: gameId, game_name: gameName});
+  res.json(data);
 });
 
 app.get('/api/rooms', async (req,res)=>{
   try{
-    // Try to select with game columns, fallback if not exist
-    let rooms, error;
-    try{
-      const result = await supabase.from('rooms').select('*').order('created_at', {ascending:false}).limit(150);
-      rooms = result.data;
-      error = result.error;
-    }catch(e){
-      const result = await supabase.from('rooms').select('*').order('created_at', {ascending:false}).limit(150);
-      rooms = result.data;
-      error = result.error;
-    }
-    
+    const {data: rooms, error} = await supabase.from('rooms').select('*').order('created_at', {ascending:false}).limit(100);
     if(error) return res.status(500).json({error: error.message});
     
+    // Lọc phòng đang hoạt động (chưa finished hoặc finished trong 5 phút gần đây để vẫn hiện)
     const now = new Date();
-    const gameFilter = req.query.game_type || req.query.gameType || null;
+    const activeRooms = [];
     
     for(const room of rooms || []){
+      // Bỏ phòng SOLO? Giữ lại phòng riêng thôi, bỏ SOLO khỏi danh sách chung
       if(room.id && room.id.startsWith('SOLO-')) continue;
-      if(gameFilter && room.game_type && room.game_type !== gameFilter) continue;
+      // Chỉ lấy phòng chưa finished hoặc mới finished
       if(room.status === 'finished'){
         const updatedAt = room.updated_at ? new Date(room.updated_at) : new Date(room.created_at);
         const diffMinutes = (now - updatedAt) / 1000 / 60;
-        if(diffMinutes > 10) continue;
+        if(diffMinutes > 10) continue; // bỏ phòng finished quá 10 phút
       }
       
+      // Lấy số người chơi
       const {data: players} = await supabase.from('room_players').select('user_id, is_bot').eq('room_id', room.id);
       const realPlayers = players ? players.filter(p=>!p.is_bot) : [];
       const totalPlayers = players ? players.length : 0;
 
+      // ===== FIX: CHỈ GIỮ PHÒNG CÓ NGƯỜI THẬT - XÓA PHÒNG TRỐNG =====
+      // Nếu không có ai cả -> xóa luôn khỏi DB và bỏ qua
       if(totalPlayers === 0){
+        // Xóa phòng rác khỏi DB (không block luồng chính)
         supabase.from('rooms').delete().eq('id', room.id).then(()=> {
           console.log(`[CLEANUP-GET] Xóa phòng trống ${room.id} (0 players)`);
         }).catch(()=>{});
         continue;
       }
+      // Nếu chỉ toàn bot mà không có người thật -> không hiện trong danh sách chung
       if(realPlayers.length === 0){
         continue;
       }
       
+      // Lấy tiến trình từ activeGames
       let drawnCount = 0;
       let progress = 0;
       let isPlaying = false;
@@ -1414,25 +1334,10 @@ io.on('connection', (socket)=>{
     }
   });
 
-  socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor, isDemo, gameType, gameId, gameName})=>{
-    const gType = gameType || 'loto';
-    const prefix = gType === 'loto' ? 'SOLO-' : ('SOLO-'+gType.substring(0,3).toUpperCase()+'-');
-    const roomId = prefix+nanoid(6).toUpperCase();
+  socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor, isDemo})=>{
+    const roomId = 'SOLO-'+nanoid(6).toUpperCase();
     const fee = Math.max(5, 20 - (botCount-1)*2);
-    const roomInsert = {id:roomId, host_id:userId, bet_amount:betAmount, max_players:botCount+1, fee_percent:fee, status:'waiting', name:`Solo ${botCount} bot` + (gameName ? ' - ' + gameName : '')};
-    try{
-      roomInsert.game_type = gType;
-      roomInsert.game_id = gameId || null;
-      roomInsert.game_name = gameName || gType;
-    }catch(e){}
-    try{
-      await supabase.from('rooms').insert(roomInsert);
-    }catch(e){
-      delete roomInsert.game_type;
-      delete roomInsert.game_id;
-      delete roomInsert.game_name;
-      await supabase.from('rooms').insert(roomInsert);
-    }
+    await supabase.from('rooms').insert({id:roomId, host_id:userId, bet_amount:betAmount, max_players:botCount+1, fee_percent:fee, status:'waiting', name:`Solo ${botCount} bot`});
     const username = await getUsernameById(userId);
     const color = ticketColor || '#00d2ff';
     const is_demo = !!isDemo;
@@ -2418,7 +2323,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         userId,
         username: chatUsername || 'Người chơi',
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
       };
       socket.to(roomId).emit('chat-message', chatData);
     }catch(e){ console.log('send-chat error', e.message); }
@@ -2446,7 +2351,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         toUserId,
         toUsername: receiverName,
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'}),
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'}),
         messageId: Date.now() + '_' + fromUserId
       };
       
@@ -2513,7 +2418,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         senderId,
         messageIds: messageIds || [],
         timestamp: Date.now(),
-        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
+        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
       };
       
       // Gửi cho người gửi để hiện "Đã xem"
@@ -3119,45 +3024,167 @@ setTimeout(cleanupEmptyRooms, 10000);
 
 
 
-// ===== MULTI-GAME: API lấy danh sách game từ Apps Script hoặc fallback =====
+// ===== MULTI-GAME API - Load games from Drive via Apps Script =====
+const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL_GAMES || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
+
+async function fetchFromAppsScript(action, params={}){
+  try{
+    const url = new URL(APPSCRIPT_GAMES_URL);
+    url.searchParams.set('action', action);
+    for(const [k,v] of Object.entries(params)){
+      url.searchParams.set(k, v);
+    }
+    console.log('[GAMES] Fetching from Apps Script:', url.toString().substring(0,150));
+    const resp = await fetch(url.toString());
+    const txt = await resp.text();
+    try{
+      return JSON.parse(txt);
+    }catch(e){
+      // If it's HTML directly
+      if(action==='get' || action==='html'){
+        return {ok:true, html:txt};
+      }
+      return {ok:false, error:'Invalid JSON: '+txt.substring(0,200)};
+    }
+  }catch(e){
+    console.error('[GAMES] Apps Script fetch error:', e.message);
+    return {ok:false, error:e.message};
+  }
+}
+
+// List all games
 app.get('/api/games', async (req,res)=>{
   try{
-    const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
-    if(APPSCRIPT_GAMES_URL){
-      try{
-        // Try to fetch from Apps Script
-        const fetchUrl = APPSCRIPT_GAMES_URL.includes('?') ? APPSCRIPT_GAMES_URL + '&action=list' : APPSCRIPT_GAMES_URL + '?action=list';
-        const response = await fetch(fetchUrl);
-        const data = await response.json();
-        if(data && data.ok && data.games){
-          return res.json({ok:true, games: data.games, source:'appscript'});
-        }
-      }catch(e){ console.log('Fetch games from AppsScript failed', e.message); }
-    }
-    // Fallback: hardcoded Loto game + placeholder for others
-    const fallbackGames = [
-      {id:'loto', name:'Loto Online', description:'Loto truyền thống 90 số, chơi với bot hoặc phòng riêng', icon:'🎲', game_type:'loto', gameType:'loto', isDefault:true, thumbnail:'https://cdn-icons-png.flaticon.com/512/1037/1037007.png'},
+    // Built-in Loto luôn có
+    const builtinGames = [
+      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto truyền thống 90 số - Vé đỏ, chơi với bot hoặc phòng riêng', icon:'🎲', iconUrl:'', color:'#FFD700', bgGradient:'linear-gradient(135deg, #FFD700, #FFA500)', game_type:'loto', gameType:'loto', isBuiltIn:true, maxPlayers:10, version:'1.0', modifiedTime:new Date().toISOString()}
     ];
-    res.json({ok:true, games: fallbackGames, source:'fallback'});
+    
+    const result = await fetchFromAppsScript('list');
+    if(result && result.ok && result.games && result.games.length>0){
+      // Merge, đảm bảo Loto ở đầu
+      const hasLoto = result.games.some(g=>g.id==='loto' || g.game_type==='loto');
+      const allGames = hasLoto ? result.games : [...builtinGames, ...result.games];
+      res.json({ok:true, games:allGames, count:allGames.length, source:'appscript'});
+    }else{
+      // Fallback chỉ có Loto
+      res.json({ok:true, games:builtinGames, count:builtinGames.length, source:'builtin', warning: result ? result.error : 'No games from Apps Script'});
+    }
+  }catch(e){
+    console.error('/api/games error', e);
+    res.status(500).json({ok:false, error:e.message, games:[
+      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto 90 số', icon:'🎲', game_type:'loto', isBuiltIn:true}
+    ]});
+  }
+});
+
+// Get game info
+app.get('/api/games/:fileId/info', async (req,res)=>{
+  try{
+    const fileId = req.params.fileId;
+    if(fileId==='loto'){
+      return res.json({ok:true, game:{id:'loto', name:'Loto Online', isBuiltIn:true}});
+    }
+    const result = await fetchFromAppsScript('info', {fileId});
+    res.json(result);
   }catch(e){
     res.status(500).json({ok:false, error:e.message});
   }
 });
 
-app.get('/api/games/:gameId/html', async (req,res)=>{
+// Get game HTML - quan trọng nhất để chơi game từ Drive
+app.get('/api/games/:fileId/html', async (req,res)=>{
   try{
-    const {gameId} = req.params;
-    const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
-    if(!APPSCRIPT_GAMES_URL) return res.status(400).json({ok:false, error:'No APPSCRIPT_GAMES_URL configured'});
-    const fetchUrl = APPSCRIPT_GAMES_URL + '?action=get&fileId=' + encodeURIComponent(gameId);
-    const response = await fetch(fetchUrl);
-    const html = await response.text();
-    res.setHeader('Content-Type','text/html; charset=utf-8');
+    const fileId = req.params.fileId;
+    if(!fileId) return res.status(400).send('Missing fileId');
+    
+    if(fileId==='loto'){
+      return res.status(400).json({ok:false, error:'Loto is built-in, no HTML file'});
+    }
+    
+    console.log('[GAMES] Request HTML for fileId:', fileId);
+    const result = await fetchFromAppsScript('get', {fileId, format:'raw'});
+    
+    // Apps Script có thể trả về JSON bọc HTML hoặc HTML trực tiếp
+    let html = '';
+    if(result && result.html){
+      html = result.html;
+    }else if(typeof result === 'string' && result.includes('<')){
+      html = result;
+    }else if(result && result.ok===false && result.html){
+      html = result.html;
+    }else{
+      // Thử fetch trực tiếp với action=get không format
+      const directResult = await fetchFromAppsScript('get', {fileId});
+      if(directResult && directResult.html){
+        html = directResult.html;
+      }else if(typeof directResult === 'string'){
+        html = directResult;
+      }
+    }
+    
+    if(!html || html.length<20){
+      return res.status(404).send('<div style="padding:40px;text-align:center;color:#ef4444"><h3>❌ Không tìm thấy game ' + fileId + '</h3><p>File không tồn tại trên Drive hoặc Apps Script chưa deploy.</p><p style="font-size:0.8rem;color:#94a3b8">FileId: ' + fileId + '</p></div>');
+    }
+    
+    // Inject game loader helpers
+    const helpers = `
+    <script>
+      // Bridge để game con báo về parent
+      window.GAME_LOADER = {
+        isEmbedded: window.parent !== window,
+        sendToParent: function(data){
+          if(window.parent) window.parent.postMessage(Object.assign({source:'GAME_EMBED'}, data), '*');
+        },
+        toast: function(msg, type){
+          this.sendToParent({type:'TOAST', message:msg, toastType:type||'info'});
+        }
+      };
+      // Tự động báo ready
+      window.addEventListener('load', function(){
+        setTimeout(function(){
+          window.GAME_LOADER.sendToParent({type:'GAME_READY', gameId:'${fileId}', timestamp:Date.now()});
+        }, 500);
+      });
+      console.log('[GAME EMBED] Loaded game ${fileId}, mode:', window.GAME_MODE||'unknown');
+    <\/script>
+    `;
+    
+    // Thêm helpers vào HTML
+    if(html.includes('</body>')){
+      html = html.replace('</body>', helpers + '</body>');
+    }else if(html.includes('</html>')){
+      html = html.replace('</html>', helpers + '</html>');
+    }else{
+      html = html + helpers;
+    }
+    
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.send(html);
+    
+  }catch(e){
+    console.error('/api/games/:fileId/html error', e);
+    res.status(500).send('<div style="padding:40px;text-align:center;color:#ef4444"><h3>❌ Lỗi tải game</h3><p>' + e.message + '</p></div>');
+  }
+});
+
+// Proxy download game file
+app.get('/api/games/:fileId/download', async (req,res)=>{
+  try{
+    const fileId = req.params.fileId;
+    const result = await fetchFromAppsScript('get', {fileId});
+    if(result && result.html){
+      res.setHeader('Content-Disposition', 'attachment; filename="' + fileId + '.html"');
+      res.setHeader('Content-Type', 'text/html');
+      res.send(result.html);
+    }else{
+      res.status(404).json({ok:false, error:'File not found'});
+    }
   }catch(e){
     res.status(500).json({ok:false, error:e.message});
   }
 });
+
 
 
 app.get('/', (req,res)=> res.send('Loto Online Backend Running - Demo Balance + Withdraw + Admin System - Updated Demo Win Logic'));

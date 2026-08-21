@@ -613,6 +613,173 @@ app.get('/api/user/balance', async (req, res) => {
   try{
     const userId = req.query.userId;
     if(!userId) return res.status(400).json({error: 'Thieu userId'});
+
+// ===== UNIFIED WALLET API FOR ALL GAMES (Caro, Tai Xiu, etc) - Dùng chung số dư thật và demo =====
+app.post('/api/wallet/bet', async (req,res)=>{
+  try{
+    const {userId, amount, mode, gameId, gameType, description} = req.body;
+    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
+    const amt = parseInt(amount);
+    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền cược không hợp lệ'});
+    
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
+    
+    const useDemo = (mode === 'demo' || mode === 'test' || gameId === 'demo');
+    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
+    
+    if(currentBalance < amt){
+      return res.status(400).json({ok:false, error:`Số dư ${useDemo ? 'demo' : 'thật'} không đủ. Bạn có ${currentBalance.toLocaleString()} xu`, currentBalance});
+    }
+    
+    // Deduct balance
+    const newBalance = currentBalance - amt;
+    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
+    updateField.total_wagered = (profile.total_wagered || 0) + amt;
+    
+    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
+    if(updateError) throw updateError;
+    
+    // Log transaction
+    try{
+      await supabase.from('transactions').insert({
+        user_id: userId,
+        type: 'bet',
+        amount: -amt,
+        mode: useDemo ? 'demo' : 'real',
+        game_id: gameId || 'unknown',
+        game_type: gameType || gameId || 'unknown',
+        description: description || `Cược ${amt} xu trong ${gameType || gameId}`,
+        balance_after: newBalance,
+        created_at: new Date().toISOString()
+      });
+    }catch(logErr){ console.log('Log bet error', logErr.message); }
+    
+    // Log game history
+    try{
+      await supabase.from('game_history').insert({
+        user_id: userId,
+        game_id: gameId || 'unknown',
+        game_type: gameType || 'unknown',
+        bet_amount: amt,
+        mode: useDemo ? 'demo' : 'real',
+        result: 'bet',
+        created_at: new Date().toISOString()
+      });
+    }catch(hErr){ console.log('game_history log error', hErr.message); }
+    
+    console.log(`[WALLET] ${userId} bet ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
+    
+    res.json({ok:true, newBalance, deducted: amt, mode: useDemo ? 'demo' : 'real', message:`Đã cược ${amt.toLocaleString()} xu`});
+    
+  }catch(e){
+    console.error('/api/wallet/bet error', e);
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
+app.post('/api/wallet/win', async (req,res)=>{
+  try{
+    const {userId, amount, mode, gameId, gameType, description, multiplier} = req.body;
+    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
+    const amt = parseInt(amount);
+    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền thắng không hợp lệ'});
+    
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
+    
+    const useDemo = (mode === 'demo' || mode === 'test');
+    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
+    const newBalance = currentBalance + amt;
+    
+    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
+    updateField.total_won = (profile.total_won || 0) + amt;
+    
+    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
+    if(updateError) throw updateError;
+    
+    // Log transaction
+    try{
+      await supabase.from('transactions').insert({
+        user_id: userId,
+        type: 'win',
+        amount: amt,
+        mode: useDemo ? 'demo' : 'real',
+        game_id: gameId || 'unknown',
+        game_type: gameType || 'unknown',
+        description: description || `Thắng ${amt} xu trong ${gameType || gameId} ${multiplier ? `(x${multiplier})` : ''}`,
+        balance_after: newBalance,
+        created_at: new Date().toISOString()
+      });
+    }catch(logErr){ console.log('Log win error', logErr.message); }
+    
+    // Update game history if exists
+    try{
+      await supabase.from('game_history').insert({
+        user_id: userId,
+        game_id: gameId || 'unknown',
+        game_type: gameType || 'unknown',
+        win_amount: amt,
+        mode: useDemo ? 'demo' : 'real',
+        result: 'win',
+        multiplier: multiplier || 1,
+        created_at: new Date().toISOString()
+      });
+    }catch(hErr){ console.log('game_history win log error', hErr.message); }
+    
+    console.log(`[WALLET] ${userId} win ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
+    
+    res.json({ok:true, newBalance, won: amt, mode: useDemo ? 'demo' : 'real', message:`Đã thắng ${amt.toLocaleString()} xu`});
+    
+  }catch(e){
+    console.error('/api/wallet/win error', e);
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
+app.get('/api/wallet/history', async (req,res)=>{
+  try{
+    const {userId, limit} = req.query;
+    if(!userId) return res.status(400).json({ok:false, error:'Thiếu userId'});
+    const lim = Math.min(parseInt(limit) || 20, 100);
+    
+    const {data, error} = await supabase.from('transactions')
+      .select('*')
+      .eq('user_id', userId)
+      .order('created_at', {ascending:false})
+      .limit(lim);
+    
+    if(error) throw error;
+    
+    res.json({ok:true, history: data || []});
+  }catch(e){
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
+app.post('/api/wallet/switch-mode', async (req,res)=>{
+  try{
+    const {userId, mode} = req.body;
+    if(!userId || !mode) return res.status(400).json({ok:false, error:'Thiếu userId hoặc mode'});
+    if(!['real','demo'].includes(mode)) return res.status(400).json({ok:false, error:'Mode phải là real hoặc demo'});
+    
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
+    
+    res.json({
+      ok:true,
+      mode,
+      balance: mode==='demo' ? (profile.demo_balance || 0) : (profile.balance || 0),
+      real_balance: profile.balance || 0,
+      demo_balance: profile.demo_balance || 0,
+      message: `Đã chuyển sang ${mode==='demo' ? 'số dư demo' : 'số dư thật'}`
+    });
+  }catch(e){
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
+
     const { data, error } = await supabase.from('profiles').select('balance').eq('id', userId).single();
     if(error) return res.status(404).json({error: 'User not found'});
     res.json({ balance: data.balance || 0 });
@@ -2323,7 +2490,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         userId,
         username: chatUsername || 'Người chơi',
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
       };
       socket.to(roomId).emit('chat-message', chatData);
     }catch(e){ console.log('send-chat error', e.message); }
@@ -2351,7 +2518,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         toUserId,
         toUsername: receiverName,
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'}),
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'}),
         messageId: Date.now() + '_' + fromUserId
       };
       
@@ -2418,7 +2585,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         senderId,
         messageIds: messageIds || [],
         timestamp: Date.now(),
-        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
+        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
       };
       
       // Gửi cho người gửi để hiện "Đã xem"
@@ -3021,170 +3188,6 @@ async function cleanupEmptyRooms(){
 setInterval(cleanupEmptyRooms, 60*1000);
 // Chạy ngay sau khi khởi động 10s
 setTimeout(cleanupEmptyRooms, 10000);
-
-
-
-// ===== MULTI-GAME API - Load games from Drive via Apps Script =====
-const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL_GAMES || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
-
-async function fetchFromAppsScript(action, params={}){
-  try{
-    const url = new URL(APPSCRIPT_GAMES_URL);
-    url.searchParams.set('action', action);
-    for(const [k,v] of Object.entries(params)){
-      url.searchParams.set(k, v);
-    }
-    console.log('[GAMES] Fetching from Apps Script:', url.toString().substring(0,150));
-    const resp = await fetch(url.toString());
-    const txt = await resp.text();
-    try{
-      return JSON.parse(txt);
-    }catch(e){
-      // If it's HTML directly
-      if(action==='get' || action==='html'){
-        return {ok:true, html:txt};
-      }
-      return {ok:false, error:'Invalid JSON: '+txt.substring(0,200)};
-    }
-  }catch(e){
-    console.error('[GAMES] Apps Script fetch error:', e.message);
-    return {ok:false, error:e.message};
-  }
-}
-
-// List all games
-app.get('/api/games', async (req,res)=>{
-  try{
-    // Built-in Loto luôn có
-    const builtinGames = [
-      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto truyền thống 90 số - Vé đỏ, chơi với bot hoặc phòng riêng', icon:'🎲', iconUrl:'', color:'#FFD700', bgGradient:'linear-gradient(135deg, #FFD700, #FFA500)', game_type:'loto', gameType:'loto', isBuiltIn:true, maxPlayers:10, version:'1.0', modifiedTime:new Date().toISOString()}
-    ];
-    
-    const result = await fetchFromAppsScript('list');
-    if(result && result.ok && result.games && result.games.length>0){
-      // Merge, đảm bảo Loto ở đầu
-      const hasLoto = result.games.some(g=>g.id==='loto' || g.game_type==='loto');
-      const allGames = hasLoto ? result.games : [...builtinGames, ...result.games];
-      res.json({ok:true, games:allGames, count:allGames.length, source:'appscript'});
-    }else{
-      // Fallback chỉ có Loto
-      res.json({ok:true, games:builtinGames, count:builtinGames.length, source:'builtin', warning: result ? result.error : 'No games from Apps Script'});
-    }
-  }catch(e){
-    console.error('/api/games error', e);
-    res.status(500).json({ok:false, error:e.message, games:[
-      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto 90 số', icon:'🎲', game_type:'loto', isBuiltIn:true}
-    ]});
-  }
-});
-
-// Get game info
-app.get('/api/games/:fileId/info', async (req,res)=>{
-  try{
-    const fileId = req.params.fileId;
-    if(fileId==='loto'){
-      return res.json({ok:true, game:{id:'loto', name:'Loto Online', isBuiltIn:true}});
-    }
-    const result = await fetchFromAppsScript('info', {fileId});
-    res.json(result);
-  }catch(e){
-    res.status(500).json({ok:false, error:e.message});
-  }
-});
-
-// Get game HTML - quan trọng nhất để chơi game từ Drive
-app.get('/api/games/:fileId/html', async (req,res)=>{
-  try{
-    const fileId = req.params.fileId;
-    if(!fileId) return res.status(400).send('Missing fileId');
-    
-    if(fileId==='loto'){
-      return res.status(400).json({ok:false, error:'Loto is built-in, no HTML file'});
-    }
-    
-    console.log('[GAMES] Request HTML for fileId:', fileId);
-    const result = await fetchFromAppsScript('get', {fileId, format:'raw'});
-    
-    // Apps Script có thể trả về JSON bọc HTML hoặc HTML trực tiếp
-    let html = '';
-    if(result && result.html){
-      html = result.html;
-    }else if(typeof result === 'string' && result.includes('<')){
-      html = result;
-    }else if(result && result.ok===false && result.html){
-      html = result.html;
-    }else{
-      // Thử fetch trực tiếp với action=get không format
-      const directResult = await fetchFromAppsScript('get', {fileId});
-      if(directResult && directResult.html){
-        html = directResult.html;
-      }else if(typeof directResult === 'string'){
-        html = directResult;
-      }
-    }
-    
-    if(!html || html.length<20){
-      return res.status(404).send('<div style="padding:40px;text-align:center;color:#ef4444"><h3>❌ Không tìm thấy game ' + fileId + '</h3><p>File không tồn tại trên Drive hoặc Apps Script chưa deploy.</p><p style="font-size:0.8rem;color:#94a3b8">FileId: ' + fileId + '</p></div>');
-    }
-    
-    // Inject game loader helpers
-    const helpers = `
-    <script>
-      // Bridge để game con báo về parent
-      window.GAME_LOADER = {
-        isEmbedded: window.parent !== window,
-        sendToParent: function(data){
-          if(window.parent) window.parent.postMessage(Object.assign({source:'GAME_EMBED'}, data), '*');
-        },
-        toast: function(msg, type){
-          this.sendToParent({type:'TOAST', message:msg, toastType:type||'info'});
-        }
-      };
-      // Tự động báo ready
-      window.addEventListener('load', function(){
-        setTimeout(function(){
-          window.GAME_LOADER.sendToParent({type:'GAME_READY', gameId:'${fileId}', timestamp:Date.now()});
-        }, 500);
-      });
-      console.log('[GAME EMBED] Loaded game ${fileId}, mode:', window.GAME_MODE||'unknown');
-    <\/script>
-    `;
-    
-    // Thêm helpers vào HTML
-    if(html.includes('</body>')){
-      html = html.replace('</body>', helpers + '</body>');
-    }else if(html.includes('</html>')){
-      html = html.replace('</html>', helpers + '</html>');
-    }else{
-      html = html + helpers;
-    }
-    
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(html);
-    
-  }catch(e){
-    console.error('/api/games/:fileId/html error', e);
-    res.status(500).send('<div style="padding:40px;text-align:center;color:#ef4444"><h3>❌ Lỗi tải game</h3><p>' + e.message + '</p></div>');
-  }
-});
-
-// Proxy download game file
-app.get('/api/games/:fileId/download', async (req,res)=>{
-  try{
-    const fileId = req.params.fileId;
-    const result = await fetchFromAppsScript('get', {fileId});
-    if(result && result.html){
-      res.setHeader('Content-Disposition', 'attachment; filename="' + fileId + '.html"');
-      res.setHeader('Content-Type', 'text/html');
-      res.send(result.html);
-    }else{
-      res.status(404).json({ok:false, error:'File not found'});
-    }
-  }catch(e){
-    res.status(500).json({ok:false, error:e.message});
-  }
-});
-
 
 
 app.get('/', (req,res)=> res.send('Loto Online Backend Running - Demo Balance + Withdraw + Admin System - Updated Demo Win Logic'));

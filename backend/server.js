@@ -15,7 +15,111 @@ const io = new Server(server, {
 });
 
 app.use(cors({ origin: "*" }));
-app.use(express.json());
+app.use(express.json())
+
+// ===== UNIFIED WALLET API FOR ALL GAMES (Caro, Tai Xiu, Bau Cua, Xoc Dia) - Dùng chung số dư thật và demo =====
+// GET for testing - so browser doesn't show Cannot GET
+app.get('/api/wallet/bet', (req,res)=>{
+  res.json({ok:false, error:'Use POST /api/wallet/bet with {userId, amount, mode}', method:'GET not allowed, use POST', example:{userId:'uuid', amount:10000, mode:'real'}});
+});
+
+app.post('/api/wallet/bet', async (req,res)=>{
+  console.log('[WALLET] POST /api/wallet/bet called', req.body);
+  try{
+    const {userId, amount, mode, gameId, gameType, description} = req.body;
+    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
+    const amt = parseInt(amount);
+    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền cược không hợp lệ'});
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
+    const useDemo = (mode === 'demo' || mode === 'test' || mode === 'DEMO');
+    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
+    if(currentBalance < amt){
+      return res.status(400).json({ok:false, error:`Số dư ${useDemo ? 'demo' : 'thật'} không đủ. Bạn có ${currentBalance.toLocaleString()} xu`, currentBalance});
+    }
+    const newBalance = currentBalance - amt;
+    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
+    updateField.total_wagered = (profile.total_wagered || 0) + amt;
+    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
+    if(updateError) throw updateError;
+    try{
+      await supabase.from('transactions').insert({
+        user_id: userId, type: 'bet', amount: -amt, mode: useDemo ? 'demo' : 'real',
+        game_id: gameId || 'unknown', game_type: gameType || gameId || 'unknown',
+        description: description || `Cược ${amt} xu trong ${gameType || gameId}`,
+        balance_after: newBalance, created_at: new Date().toISOString()
+      });
+    }catch(logErr){ console.log('Log bet error', logErr.message); }
+    try{
+      await supabase.from('game_history').insert({
+        user_id: userId, game_id: gameId || 'unknown', game_type: gameType || 'unknown',
+        bet_amount: amt, mode: useDemo ? 'demo' : 'real', result: 'bet', created_at: new Date().toISOString()
+      });
+    }catch(hErr){ console.log('game_history log error', hErr.message); }
+    console.log(`[WALLET] ${userId} bet ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
+    res.json({ok:true, newBalance, deducted: amt, mode: useDemo ? 'demo' : 'real', message:`Đã cược ${amt.toLocaleString()} xu`});
+  }catch(e){ console.error('/api/wallet/bet error', e); res.status(500).json({ok:false, error:e.message}); }
+});
+
+app.get('/api/wallet/win', (req,res)=>{
+  res.json({ok:false, error:'Use POST /api/wallet/win'});
+});
+
+app.post('/api/wallet/win', async (req,res)=>{
+  try{
+    const {userId, amount, mode, gameId, gameType, description, multiplier} = req.body;
+    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
+    const amt = parseInt(amount);
+    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền thắng không hợp lệ'});
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
+    const useDemo = (mode === 'demo' || mode === 'test' || mode === 'DEMO');
+    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
+    const newBalance = currentBalance + amt;
+    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
+    updateField.total_won = (profile.total_won || 0) + amt;
+    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
+    if(updateError) throw updateError;
+    try{
+      await supabase.from('transactions').insert({
+        user_id: userId, type: 'win', amount: amt, mode: useDemo ? 'demo' : 'real',
+        game_id: gameId || 'unknown', game_type: gameType || 'unknown',
+        description: description || `Thắng ${amt} xu trong ${gameType || gameId} ${multiplier ? `(x${multiplier})` : ''}`,
+        balance_after: newBalance, created_at: new Date().toISOString()
+      });
+    }catch(logErr){ console.log('Log win error', logErr.message); }
+    try{
+      await supabase.from('game_history').insert({
+        user_id: userId, game_id: gameId || 'unknown', game_type: gameType || 'unknown',
+        win_amount: amt, mode: useDemo ? 'demo' : 'real', result: 'win', multiplier: multiplier || 1, created_at: new Date().toISOString()
+      });
+    }catch(hErr){ console.log('game_history win log error', hErr.message); }
+    console.log(`[WALLET] ${userId} win ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
+    res.json({ok:true, newBalance, won: amt, mode: useDemo ? 'demo' : 'real', message:`Đã thắng ${amt.toLocaleString()} xu`});
+  }catch(e){ console.error('/api/wallet/win error', e); res.status(500).json({ok:false, error:e.message}); }
+});
+
+app.get('/api/wallet', (req,res)=>{
+  res.json({ok:true, endpoints:['POST /api/wallet/bet','POST /api/wallet/win','GET /api/wallet/history','POST /api/wallet/switch-mode'], message:'Wallet API is running'});
+});
+
+app.get('/api/wallet/history', async (req,res)=>{
+  try{
+    const {userId, limit} = req.query;
+    if(!userId) return res.status(400).json({ok:false, error:'Thiếu userId'});
+    const lim = Math.min(parseInt(limit) || 20, 100);
+    const {data, error} = await supabase.from('transactions').select('*').eq('user_id', userId).order('created_at', {ascending:false}).limit(lim);
+    if(error) throw error;
+    res.json({ok:true, history: data || []});
+  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
+});
+
+app.post('/api/wallet/switch-mode', async (req,res)=>{
+  try{
+    const {userId, mode} = req.body;
+    if(!userId || !mode) return res.status(400).json({ok:false, error:'Thiếu userId hoặc mode'});
+
+;
 
 const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
 const DEPOSIT_BANK_INFO = {
@@ -614,106 +718,7 @@ app.get('/api/user/balance', async (req, res) => {
     const userId = req.query.userId;
     if(!userId) return res.status(400).json({error: 'Thieu userId'});
 
-// ===== UNIFIED WALLET API FOR ALL GAMES (Caro, Tai Xiu, Bau Cua, Xoc Dia) - Dùng chung số dư thật và demo =====
-// GET for testing - so browser doesn't show Cannot GET
-app.get('/api/wallet/bet', (req,res)=>{
-  res.json({ok:false, error:'Use POST /api/wallet/bet with {userId, amount, mode}', method:'GET not allowed, use POST', example:{userId:'uuid', amount:10000, mode:'real'}});
-});
 
-app.post('/api/wallet/bet', async (req,res)=>{
-  try{
-    const {userId, amount, mode, gameId, gameType, description} = req.body;
-    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
-    const amt = parseInt(amount);
-    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền cược không hợp lệ'});
-    const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
-    const useDemo = (mode === 'demo' || mode === 'test' || mode === 'DEMO');
-    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
-    if(currentBalance < amt){
-      return res.status(400).json({ok:false, error:`Số dư ${useDemo ? 'demo' : 'thật'} không đủ. Bạn có ${currentBalance.toLocaleString()} xu`, currentBalance});
-    }
-    const newBalance = currentBalance - amt;
-    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
-    updateField.total_wagered = (profile.total_wagered || 0) + amt;
-    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
-    if(updateError) throw updateError;
-    try{
-      await supabase.from('transactions').insert({
-        user_id: userId, type: 'bet', amount: -amt, mode: useDemo ? 'demo' : 'real',
-        game_id: gameId || 'unknown', game_type: gameType || gameId || 'unknown',
-        description: description || `Cược ${amt} xu trong ${gameType || gameId}`,
-        balance_after: newBalance, created_at: new Date().toISOString()
-      });
-    }catch(logErr){ console.log('Log bet error', logErr.message); }
-    try{
-      await supabase.from('game_history').insert({
-        user_id: userId, game_id: gameId || 'unknown', game_type: gameType || 'unknown',
-        bet_amount: amt, mode: useDemo ? 'demo' : 'real', result: 'bet', created_at: new Date().toISOString()
-      });
-    }catch(hErr){ console.log('game_history log error', hErr.message); }
-    console.log(`[WALLET] ${userId} bet ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
-    res.json({ok:true, newBalance, deducted: amt, mode: useDemo ? 'demo' : 'real', message:`Đã cược ${amt.toLocaleString()} xu`});
-  }catch(e){ console.error('/api/wallet/bet error', e); res.status(500).json({ok:false, error:e.message}); }
-});
-
-app.get('/api/wallet/win', (req,res)=>{
-  res.json({ok:false, error:'Use POST /api/wallet/win'});
-});
-
-app.post('/api/wallet/win', async (req,res)=>{
-  try{
-    const {userId, amount, mode, gameId, gameType, description, multiplier} = req.body;
-    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
-    const amt = parseInt(amount);
-    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền thắng không hợp lệ'});
-    const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
-    const useDemo = (mode === 'demo' || mode === 'test' || mode === 'DEMO');
-    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
-    const newBalance = currentBalance + amt;
-    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
-    updateField.total_won = (profile.total_won || 0) + amt;
-    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
-    if(updateError) throw updateError;
-    try{
-      await supabase.from('transactions').insert({
-        user_id: userId, type: 'win', amount: amt, mode: useDemo ? 'demo' : 'real',
-        game_id: gameId || 'unknown', game_type: gameType || 'unknown',
-        description: description || `Thắng ${amt} xu trong ${gameType || gameId} ${multiplier ? `(x${multiplier})` : ''}`,
-        balance_after: newBalance, created_at: new Date().toISOString()
-      });
-    }catch(logErr){ console.log('Log win error', logErr.message); }
-    try{
-      await supabase.from('game_history').insert({
-        user_id: userId, game_id: gameId || 'unknown', game_type: gameType || 'unknown',
-        win_amount: amt, mode: useDemo ? 'demo' : 'real', result: 'win', multiplier: multiplier || 1, created_at: new Date().toISOString()
-      });
-    }catch(hErr){ console.log('game_history win log error', hErr.message); }
-    console.log(`[WALLET] ${userId} win ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
-    res.json({ok:true, newBalance, won: amt, mode: useDemo ? 'demo' : 'real', message:`Đã thắng ${amt.toLocaleString()} xu`});
-  }catch(e){ console.error('/api/wallet/win error', e); res.status(500).json({ok:false, error:e.message}); }
-});
-
-app.get('/api/wallet', (req,res)=>{
-  res.json({ok:true, endpoints:['POST /api/wallet/bet','POST /api/wallet/win','GET /api/wallet/history','POST /api/wallet/switch-mode'], message:'Wallet API is running'});
-});
-
-app.get('/api/wallet/history', async (req,res)=>{
-  try{
-    const {userId, limit} = req.query;
-    if(!userId) return res.status(400).json({ok:false, error:'Thiếu userId'});
-    const lim = Math.min(parseInt(limit) || 20, 100);
-    const {data, error} = await supabase.from('transactions').select('*').eq('user_id', userId).order('created_at', {ascending:false}).limit(lim);
-    if(error) throw error;
-    res.json({ok:true, history: data || []});
-  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
-});
-
-app.post('/api/wallet/switch-mode', async (req,res)=>{
-  try{
-    const {userId, mode} = req.body;
-    if(!userId || !mode) return res.status(400).json({ok:false, error:'Thiếu userId hoặc mode'});
     if(!['real','demo'].includes(mode)) return res.status(400).json({ok:false, error:'Mode phải là real hoặc demo'});
     const profile = await getProfileById(userId);
     if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});

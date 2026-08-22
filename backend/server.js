@@ -27,7 +27,6 @@ const DEPOSIT_BANK = DEPOSIT_BANK_INFO;
 
 // ===================== MODULAR GAME SYSTEM - V3 UPGRADE =====================
 // Thêm vào để hỗ trợ caro, bầu cua dùng chung ví
-import axios from 'axios';
 import fs from 'fs';
 import path from 'path';
 

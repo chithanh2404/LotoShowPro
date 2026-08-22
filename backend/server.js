@@ -3447,11 +3447,7 @@ app.post('/api/game/reward', async(req,res)=>{
 });
 
 // ===== WALLET API ALIASES FOR CARO V3 (compat) =====
-app.get('/api/profile/:userId', async (req,res)=>{
-  try{
-    const {userId}=req.params;
-    const {data, error} = await supabase.from('profiles').select('*').eq('id', userId).single();
-    if(error) return res.status(404).json({error:error.message});
+
     res.json(data);
   }catch(e){ res.status(500).json({error:e.message}); }
 });

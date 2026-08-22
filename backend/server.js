@@ -3446,12 +3446,6 @@ app.post('/api/game/reward', async(req,res)=>{
   }catch(e){ res.status(400).json({ok:false, error:e.message}); }
 });
 
-// ===== WALLET API ALIASES FOR CARO V3 (compat) =====
-
-    res.json(data);
-  }catch(e){ res.status(500).json({error:e.message}); }
-});
-
 app.post('/api/wallet/bet', async (req,res)=>{
   const {userId, amount, mode, gameId, roomId, description} = req.body;
   const betAmount = Number(amount);

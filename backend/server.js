@@ -25,6 +25,168 @@ const DEPOSIT_BANK_INFO = {
 };
 const DEPOSIT_BANK = DEPOSIT_BANK_INFO;
 
+// ===================== MODULAR GAME SYSTEM - V3 UPGRADE =====================
+// Thêm vào để hỗ trợ caro, bầu cua dùng chung ví
+import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+
+const GAME_FOLDER_MODULES = path.join(process.cwd(), 'games');
+if(!fs.existsSync(GAME_FOLDER_MODULES)) fs.mkdirSync(GAME_FOLDER_MODULES, {recursive:true});
+
+// Cache game list từ Appscript
+let cachedGameList = null;
+let cachedGameListTime = 0;
+const GAME_LIST_TTL = 5*60*1000;
+
+async function fetchGameModulesFromDrive(){
+  if(cachedGameList && (Date.now()-cachedGameListTime)<GAME_LIST_TTL) return cachedGameList;
+  try{
+    const url = process.env.APPSCRIPT_URL;
+    if(!url) throw new Error('Missing APPSCRIPT_URL');
+    const resp = await fetch(url + '?action=modules');
+    const data = await resp.json();
+    if(data && data.ok && data.games){
+      cachedGameList = data.games;
+      cachedGameListTime = Date.now();
+      return cachedGameList;
+    }
+  }catch(e){ console.log('[Modules] fetch error', e.message); }
+  // fallback local
+  const localGames=[];
+  if(fs.existsSync(GAME_FOLDER_MODULES)){
+    for(const dir of fs.readdirSync(GAME_FOLDER_MODULES)){
+      const full=path.join(GAME_FOLDER_MODULES,dir);
+      if(fs.statSync(full).isDirectory()){
+        let meta={}; try{ meta=JSON.parse(fs.readFileSync(path.join(full,'meta.json'),'utf8')); }catch{}
+        localGames.push({id:meta.id||dir, name:meta.name||dir, icon:meta.icon||'🎮', gameType:meta.gameType||dir, isLocal:true, minBet: meta.minBet||1000, maxBet: meta.maxBet||100000});
+      }
+    }
+  }
+  cachedGameList = [{id:'loto', name:'Loto Online', icon:'🎲', isBuiltIn:true, gameType:'loto', color:'#FFD700'}, ...localGames];
+  cachedGameListTime = Date.now();
+  return cachedGameList;
+}
+
+// Load HTML game từ Drive
+async function loadGameHtmlFromDrive(fileId){
+  try{
+    const url = process.env.APPSCRIPT_URL;
+    const resp = await fetch(url + `?action=get&fileId=${fileId}&format=json`);
+    const data = await resp.json();
+    if(data && data.ok && data.html) return data.html;
+    // thử raw html
+    const r2 = await fetch(url + `?action=get&fileId=${fileId}`);
+    const t = await r2.text();
+    if(t && t.includes('<')) return t;
+  }catch(e){ console.log('loadGameHtml error', e.message); }
+  // fallback local file
+  const localPath = path.join(GAME_FOLDER_MODULES, fileId, 'index.html');
+  if(fs.existsSync(localPath)) return fs.readFileSync(localPath,'utf8');
+  return null;
+}
+
+// Inject WalletBridge + Supabase Bridge vào HTML game module
+function injectWalletBridgeForSupabase(rawHtml, gameId){
+  const bridge = `
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script>
+    window.GAME_ID = "${gameId}";
+    window.SupabaseWallet = {
+      async getProfile(){
+        const token = localStorage.getItem('loto_token') || window.__PARENT_TOKEN__ || window.parent?.localStorage?.getItem('sb-access-token');
+        return window.parent?.currentUser || null;
+      },
+      async placeBet(amount, meta){
+        return new Promise((resolve,reject)=>{
+          const reqId = Date.now()+'_'+Math.random();
+          const handler = (e)=>{
+            if(e.data && e.data.type==='BET_RESULT' && e.data.reqId===reqId){
+              window.removeEventListener('message', handler);
+              if(e.data.ok) resolve(e.data); else reject(new Error(e.data.error));
+            }
+          };
+          window.addEventListener('message', handler);
+          window.parent.postMessage({type:'GAME_BET', gameId:"${gameId}", amount, meta, reqId}, '*');
+          setTimeout(()=>{ window.removeEventListener('message', handler); reject(new Error('Timeout')); }, 8000);
+        });
+      },
+      async claimReward(amount, reason, meta){
+        return new Promise((resolve,reject)=>{
+          const reqId = Date.now()+'_'+Math.random();
+          const handler = (e)=>{
+            if(e.data && e.data.type==='REWARD_RESULT' && e.data.reqId===reqId){
+              window.removeEventListener('message', handler);
+              if(e.data.ok) resolve(e.data); else reject(new Error(e.data.error));
+            }
+          };
+          window.addEventListener('message', handler);
+          window.parent.postMessage({type:'GAME_REWARD', gameId:"${gameId}", amount, reason, meta, reqId}, '*');
+          setTimeout(()=>{ window.removeEventListener('message', handler); reject(new Error('Timeout')); }, 8000);
+        });
+      },
+      async getBalance(){
+        const p = await this.getProfile();
+        return p ? (p.balance + (p.demo_balance||0)) : 0;
+      }
+    };
+    window.WalletBridge = window.SupabaseWallet;
+    window.ParentAPI = window.SupabaseWallet;
+    window.addEventListener('message', (e)=>{
+      if(e.data?.type==='PARENT_TOKEN') window.__PARENT_TOKEN__=e.data.token;
+      if(e.data?.type==='PARENT_USER') window.__PARENT_USER__=e.data.user;
+      if(e.data?.type==='BALANCE_UPDATE'){ const el=document.getElementById('bal'); if(el) el.innerText=(e.data.balance||0).toLocaleString('vi-VN'); }
+    });
+  </script>`;
+  if(rawHtml.includes('</head>')) return rawHtml.replace('</head>', bridge+'</head>');
+  return bridge+rawHtml;
+}
+
+// ===== WALLET SERVICE DÙNG CHUNG SUPABASE (giống Loto) =====
+async function deductBalanceSupabase(userId, amount, gameId, roomId, description){
+  amount = Number(amount);
+  const {data: prof} = await supabase.from('profiles').select('balance, demo_balance, total_wagered').eq('id', userId).single();
+  if(!prof) throw new Error('Profile not found');
+  let newBal = prof.balance||0, newDemo = prof.demo_balance||0, deductedFrom='demo';
+  if(newDemo >= amount){
+    newDemo -= amount;
+    await supabase.from('profiles').update({demo_balance:newDemo, total_wagered:(prof.total_wagered||0)+amount}).eq('id', userId);
+  }else if((prof.balance||0) >= amount){
+    newBal -= amount; deductedFrom='real';
+    await supabase.from('profiles').update({balance:newBal, total_wagered:(prof.total_wagered||0)+amount}).eq('id', userId);
+  }else{
+    const need = amount - newDemo;
+    if((prof.balance||0) >= need){
+      const demoDeduct = newDemo; newDemo=0; newBal -= need;
+      await supabase.from('profiles').update({balance:newBal, demo_balance:newDemo, total_wagered:(prof.total_wagered||0)+amount}).eq('id', userId);
+      deductedFrom='mixed';
+    }else throw new Error('Không đủ xu. Bạn có '+(prof.balance+prof.demo_balance)+' xu');
+  }
+  await supabase.from('transactions').insert([{user_id:userId, type: deductedFrom==='real'?'lose':'lose_demo', amount:-amount, room_id:roomId, description: description||`Cược ${amount} game ${gameId}`}]);
+  return {balance:newBal, demo_balance:newDemo, deductedFrom};
+}
+
+async function addRewardSupabase(userId, amount, gameId, roomId, description, isDemoWin=false){
+  amount = Number(amount);
+  const {data: prof} = await supabase.from('profiles').select('balance, demo_balance').eq('id', userId).single();
+  if(!prof) throw new Error('Profile not found');
+  // nếu trước đó cược bằng demo thì cộng vào demo, nếu cược real thì cộng real
+  // đơn giản: cộng vào demo_balance nếu prof có demo, không thì real
+  if(isDemoWin || (prof.demo_balance||0) >0){
+    const newDemo = (prof.demo_balance||0)+amount;
+    await supabase.from('profiles').update({demo_balance:newDemo}).eq('id', userId);
+    await supabase.from('transactions').insert([{user_id:userId, type:'win_demo', amount, room_id:roomId, description: description||`Thắng ${amount} game ${gameId}`}]);
+    return {balance: prof.balance, demo_balance:newDemo};
+  }else{
+    const newBal = (prof.balance||0)+amount;
+    await supabase.from('profiles').update({balance:newBal}).eq('id', userId);
+    await supabase.from('transactions').insert([{user_id:userId, type:'win', amount, room_id:roomId, description: description||`Thắng ${amount} game ${gameId}`}]);
+    return {balance:newBal, demo_balance: prof.demo_balance};
+  }
+}
+
+
+
 const APPSCRIPT_URL = process.env.APPSCRIPT_URL;
 
 // Helper lay username tu profiles
@@ -613,132 +775,6 @@ app.get('/api/user/balance', async (req, res) => {
   try{
     const userId = req.query.userId;
     if(!userId) return res.status(400).json({error: 'Thieu userId'});
-
-// ===== UNIFIED WALLET API FOR ALL GAMES (Caro, Tai Xiu, Bau Cua, Xoc Dia) - Dùng chung số dư thật và demo =====
-// GET for testing - so browser doesn't show Cannot GET
-app.get('/api/wallet/bet', (req,res)=>{
-  res.json({ok:false, error:'Use POST /api/wallet/bet with {userId, amount, mode}', method:'GET not allowed, use POST', example:{userId:'uuid', amount:10000, mode:'real'}});
-});
-
-app.get('/api/wallet/win', (req,res)=>{
-  res.json({ok:false, error:'Use POST /api/wallet/win'});
-});
-
-app.get('/api/wallet', (req,res)=>{
-  res.json({ok:true, endpoints:['POST /api/wallet/bet','POST /api/wallet/win','GET /api/wallet/history','POST /api/wallet/switch-mode'], message:'Wallet API is running'});
-});
-
-app.post('/api/wallet/bet', async (req,res)=>{
-  console.log('[WALLET] POST /api/wallet/bet called', req.body);
-  try{
-    const {userId, amount, mode, gameId, gameType, description} = req.body;
-    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
-    const amt = parseInt(amount);
-    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền cược không hợp lệ'});
-    const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
-    const useDemo = (mode === 'demo' || mode === 'test' || mode === 'DEMO');
-    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
-    if(currentBalance < amt){
-      return res.status(400).json({ok:false, error:`Số dư ${useDemo ? 'demo' : 'thật'} không đủ. Bạn có ${currentBalance.toLocaleString()} xu`, currentBalance});
-    }
-    const newBalance = currentBalance - amt;
-    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
-    updateField.total_wagered = (profile.total_wagered || 0) + amt;
-    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
-    if(updateError) throw updateError;
-    try{
-      await supabase.from('transactions').insert({
-        user_id: userId, type: 'bet', amount: -amt, mode: useDemo ? 'demo' : 'real',
-        game_id: gameId || 'unknown', game_type: gameType || gameId || 'unknown',
-        description: description || `Cược ${amt} xu trong ${gameType || gameId}`,
-        balance_after: newBalance, created_at: new Date().toISOString()
-      });
-    }catch(logErr){ console.log('Log bet error', logErr.message); }
-    try{
-      await supabase.from('game_history').insert({
-        user_id: userId, game_id: gameId || 'unknown', game_type: gameType || 'unknown',
-        bet_amount: amt, mode: useDemo ? 'demo' : 'real', result: 'bet', created_at: new Date().toISOString()
-      });
-    }catch(hErr){ console.log('game_history log error', hErr.message); }
-    console.log(`[WALLET] ${userId} bet ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
-    // Lấy lại profile để trả về cả 2 số dư
-    try{
-      const updatedProfile = await getProfileById(userId);
-      res.json({
-        ok:true, 
-        newBalance, 
-        deducted: amt, 
-        mode: useDemo ? 'demo' : 'real', 
-        realBalance: updatedProfile ? (updatedProfile.balance || 0) : (useDemo ? currentBalance : newBalance),
-        demoBalance: updatedProfile ? (updatedProfile.demo_balance || 0) : (useDemo ? newBalance : currentBalance),
-        real_balance: updatedProfile ? (updatedProfile.balance || 0) : 0,
-        demo_balance: updatedProfile ? (updatedProfile.demo_balance || 0) : 0,
-        message:`Đã cược ${amt.toLocaleString()} xu`
-      });
-    }catch(e){
-      res.json({ok:true, newBalance, deducted: amt, mode: useDemo ? 'demo' : 'real', message:`Đã cược ${amt.toLocaleString()} xu`});
-    }
-  }catch(e){ console.error('/api/wallet/bet error', e); res.status(500).json({ok:false, error:e.message}); }
-});
-
-app.post('/api/wallet/win', async (req,res)=>{
-  try{
-    const {userId, amount, mode, gameId, gameType, description, multiplier} = req.body;
-    if(!userId || !amount) return res.status(400).json({ok:false, error:'Thiếu userId hoặc amount'});
-    const amt = parseInt(amount);
-    if(isNaN(amt) || amt <=0) return res.status(400).json({ok:false, error:'Số tiền thắng không hợp lệ'});
-    const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
-    const useDemo = (mode === 'demo' || mode === 'test' || mode === 'DEMO');
-    const currentBalance = useDemo ? (profile.demo_balance || 0) : (profile.balance || 0);
-    const newBalance = currentBalance + amt;
-    const updateField = useDemo ? {demo_balance: newBalance} : {balance: newBalance};
-    updateField.total_won = (profile.total_won || 0) + amt;
-    const {error: updateError} = await supabase.from('profiles').update(updateField).eq('id', userId);
-    if(updateError) throw updateError;
-    try{
-      await supabase.from('transactions').insert({
-        user_id: userId, type: 'win', amount: amt, mode: useDemo ? 'demo' : 'real',
-        game_id: gameId || 'unknown', game_type: gameType || 'unknown',
-        description: description || `Thắng ${amt} xu trong ${gameType || gameId} ${multiplier ? `(x${multiplier})` : ''}`,
-        balance_after: newBalance, created_at: new Date().toISOString()
-      });
-    }catch(logErr){ console.log('Log win error', logErr.message); }
-    try{
-      await supabase.from('game_history').insert({
-        user_id: userId, game_id: gameId || 'unknown', game_type: gameType || 'unknown',
-        win_amount: amt, mode: useDemo ? 'demo' : 'real', result: 'win', multiplier: multiplier || 1, created_at: new Date().toISOString()
-      });
-    }catch(hErr){ console.log('game_history win log error', hErr.message); }
-    console.log(`[WALLET] ${userId} win ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
-    res.json({ok:true, newBalance, won: amt, mode: useDemo ? 'demo' : 'real', message:`Đã thắng ${amt.toLocaleString()} xu`});
-  }catch(e){ console.error('/api/wallet/win error', e); res.status(500).json({ok:false, error:e.message}); }
-});
-
-app.get('/api/wallet/history', async (req,res)=>{
-  try{
-    const {userId, limit} = req.query;
-    if(!userId) return res.status(400).json({ok:false, error:'Thiếu userId'});
-    const lim = Math.min(parseInt(limit) || 20, 100);
-    const {data, error} = await supabase.from('transactions').select('*').eq('user_id', userId).order('created_at', {ascending:false}).limit(lim);
-    if(error) throw error;
-    res.json({ok:true, history: data || []});
-  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
-});
-
-app.post('/api/wallet/switch-mode', async (req,res)=>{
-  try{
-    const {userId, mode} = req.body;
-    if(!userId || !mode) return res.status(400).json({ok:false, error:'Thiếu userId hoặc mode'});
-    if(!['real','demo'].includes(mode)) return res.status(400).json({ok:false, error:'Mode phải là real hoặc demo'});
-    const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({ok:false, error:'User không tồn tại'});
-    res.json({ok:true, mode, balance: mode==='demo' ? (profile.demo_balance || 0) : (profile.balance || 0), real_balance: profile.balance || 0, demo_balance: profile.demo_balance || 0, message: `Đã chuyển sang ${mode==='demo' ? 'số dư demo' : 'số dư thật'}`});
-  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
-});
-
-
     const { data, error } = await supabase.from('profiles').select('balance').eq('id', userId).single();
     if(error) return res.status(404).json({error: 'User not found'});
     res.json({ balance: data.balance || 0 });
@@ -896,95 +932,11 @@ app.get('/api/tickets/generate', (req,res)=>{
   res.json({tickets});
 });
 
-app.post('/api/rooms/create', async (req,res)=>{
-  console.log('[ROOMS] POST /api/rooms/create called', req.body);
-  try{
-    const {hostId, name, password, betAmount, maxPlayers, isDemo, gameType, gameId, roomId} = req.body;
-    console.log('[ROOMS] Creating room via /create alias', {hostId, name, betAmount, gameType, gameId, isDemo});
-    
-    let prefix = 'CARO-';
-    const gt = (gameId || gameType || '').toLowerCase();
-    if(gt.includes('caro')) prefix='CARO-';
-    else if(gt.includes('taixiu')||gt.includes('tai_xiu')) prefix='TAIXIU-';
-    else if(gt.includes('baucua')||gt.includes('bau_cua')) prefix='BAUCUA-';
-    else if(gt.includes('xocdia')||gt.includes('xoc_dia')) prefix='XOCDIA-';
-    else if(gt) prefix = gt.toUpperCase().substring(0,6)+'-';
-    
-    const finalRoomId = roomId || (prefix + Math.random().toString(36).substr(2,6).toUpperCase());
-    const fee = 20;
-    
-    // Dùng đúng cột có trong bảng rooms (không có is_demo)
-    // Bảng rooms có: id, name, host_id, password, bet_amount, max_players, status, fee_percent, game_id, game_type, game_name, current_numbers, winner_id
-    let roomInsertData = {
-      id: finalRoomId, 
-      name: name || 'Caro Vip', 
-      host_id: hostId, 
-      password: password||null, 
-      bet_amount: betAmount || 10000, 
-      max_players: maxPlayers||8, 
-      fee_percent: fee, 
-      status: 'waiting',
-      game_id: gameId || gameType || 'caro',
-      game_type: gameType || gameId || 'caro',
-      game_name: (gameType || gameId || 'caro').toUpperCase() + ' Online'
-    };
-    
-    console.log('[ROOMS] Insert data', roomInsertData);
-    let {data, error} = await supabase.from('rooms').insert(roomInsertData).select().single();
-    
-    if(error && error.message && error.message.includes('game_type')){
-      console.log('[ROOMS] game_type column not exists, fallback without it');
-      const {game_type, ...fallbackData} = roomInsertData;
-      const result = await supabase.from('rooms').insert(fallbackData).select().single();
-      data = result.data;
-      error = result.error;
-    }
-    
-    if(error){
-      console.error('[ROOMS] Create error', error);
-      return res.status(500).json({ok:false, error:error.message, details:error});
-    }
-    
-    console.log('[ROOMS] Created room', finalRoomId);
-    res.json({ok:true, id: finalRoomId, room: data, roomId: finalRoomId});
-  }catch(e){
-    console.error('[ROOMS] /create error', e);
-    res.status(500).json({ok:false, error:e.message});
-  }
-});
-
 app.post('/api/rooms', async (req,res)=>{
-  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo, gameType, gameId: reqGameId, roomId: reqRoomId} = req.body;
-    let prefix = 'LOTO-';
-  if(reqGameId){
-    const gt = (reqGameId||'').toLowerCase();
-    if(gt.includes('caro')) prefix='CARO-';
-    else if(gt.includes('taixiu')||gt.includes('tai_xiu')||gt.includes('tai-xiu')) prefix='TAIXIU-';
-    else if(gt.includes('baucua')||gt.includes('bau_cua')) prefix='BAUCUA-';
-    else if(gt.includes('xocdia')||gt.includes('xoc_dia')) prefix='XOCDIA-';
-    else if(gt) prefix = gt.toUpperCase().substring(0,6)+'-';
-  } else if(gameType){
-    const gt = (gameType||'').toLowerCase();
-    if(gt.includes('caro')) prefix='CARO-';
-    else if(gt.includes('taixiu')) prefix='TAIXIU-';
-    else if(gt.includes('baucua')) prefix='BAUCUA-';
-    else if(gt.includes('xocdia')) prefix='XOCDIA-';
-  }
-  const id = (reqRoomId && reqRoomId.startsWith(prefix)) ? reqRoomId : (reqRoomId || (prefix+nanoid(6).toUpperCase()));
+  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo} = req.body;
+  const id = 'LOTO-'+nanoid(6).toUpperCase();
   const fee = 20;
-    // Thử insert với game_type, nếu lỗi (cột chưa tồn tại) thì fallback không có game_type
-  let roomInsertData = {id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'};
-  if(gameType || reqGameId){
-    roomInsertData.game_type = gameType || reqGameId || 'loto';
-  }
-  let {data, error} = await supabase.from('rooms').insert(roomInsertData).select().single();
-  if(error && error.message && error.message.includes('game_type')){
-    console.log('[ROOM] game_type column not exists, fallback without it');
-    const {game_type, ...fallbackData} = roomInsertData;
-    const result = await supabase.from('rooms').insert(fallbackData).select().single();
-    data = result.data;
-    error = result.error;
-  }
+  const {data, error} = await supabase.from('rooms').insert({id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'}).select().single();
   if(error) return res.status(500).json({error});
   const finalTicket = ticket || generateLotoTicket();
   const username = await getUsernameById(hostId);
@@ -999,15 +951,7 @@ app.post('/api/rooms', async (req,res)=>{
 
 app.get('/api/rooms', async (req,res)=>{
   try{
-    const gameTypeFilter = req.query.game_type || req.query.gameType;
-    let query = supabase.from('rooms').select('*').order('created_at', {ascending:false}).limit(100);
-    if(gameTypeFilter){
-      // Thử filter bằng game_type, nếu không có cột thì filter bằng prefix id
-      try{
-        query = query.eq('game_type', gameTypeFilter);
-      }catch(e){}
-    }
-    const {data: rooms, error} = await query;
+    const {data: rooms, error} = await supabase.from('rooms').select('*').order('created_at', {ascending:false}).limit(100);
     if(error) return res.status(500).json({error: error.message});
     
     // Lọc phòng đang hoạt động (chưa finished hoặc finished trong 5 phút gần đây để vẫn hiện)
@@ -1076,10 +1020,7 @@ app.get('/api/rooms', async (req,res)=>{
         progress: progress,
         isPlaying: isPlaying,
         created_at: room.created_at,
-        host_id: room.host_id,
-        game_type: room.game_type || (room.id && room.id.includes('-') ? room.id.split('-')[0].toLowerCase() : 'loto'),
-        gameType: room.game_type || (room.id && room.id.includes('-') ? room.id.split('-')[0].toLowerCase() : 'loto'),
-        game_id: room.game_type || (room.id && room.id.includes('-') ? room.id.split('-')[0].toLowerCase() : 'loto')
+        host_id: room.host_id
       });
     }
     
@@ -1354,29 +1295,11 @@ io.on('connection', (socket)=>{
       return socket.emit('error','Phòng đã đầy ('+maxPlayersAllowed+' người)! Vui lòng chọn phòng khác.');
     }
     if(!existList || existList.length===0){
-      const isLotoRoom = !room.game_type || room.game_type.toLowerCase()==='loto' || roomId.toUpperCase().startsWith('LOTO-');
-      const finalTicket = isLotoRoom ? (ticket || generateLotoTicket()) : (ticket || null);
+      const finalTicket = ticket || generateLotoTicket();
       const username = await getUsernameById(userId);
       const color = ticketColor || '#'+Math.floor(Math.random()*16777215).toString(16);
       const is_demo = !!isDemo;
-      const insertData = {room_id:roomId, user_id:userId, username: username, ticket: finalTicket, ticket_color: color, is_bot:false, is_demo};
-      // For non-loto, allow null ticket if table requires it, try without ticket field if needed
-      try{
-        await supabase.from('room_players').insert(insertData);
-      }catch(e){
-        // Fallback: if ticket column not nullable for non-loto, try with empty array or minimal
-        console.log('[JOIN-ROOM] Insert failed, trying fallback', e.message);
-        const fallback = {...insertData};
-        if(!isLotoRoom) delete fallback.ticket;
-        try{
-          await supabase.from('room_players').insert(fallback);
-        }catch(e2){
-          // last fallback with ticket as empty
-          fallback.ticket = ticket || [];
-          await supabase.from('room_players').insert(fallback);
-        }
-      }
-
+      await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: finalTicket, ticket_color: color, is_bot:false, is_demo});
     } else if(existList.length>1){
       for(let i=1;i<existList.length;i++){
         await supabase.from('room_players').delete().eq('id', existList[i].id);
@@ -1572,6 +1495,152 @@ io.on('connection', (socket)=>{
       console.log('mid-game join sync error', e.message);
     }
   });
+
+
+  // ===== MODULAR GAMES SOCKET - CARO + BAU CUA DÙNG CHUNG VÍ =====
+  // Lưu room cho modular games
+  if(!global.modularRooms) global.modularRooms = new Map();
+
+  socket.on('modular-join', async ({roomId, gameId, userId})=>{
+    if(!roomId||!gameId||!userId) return;
+    socket.join(roomId);
+    if(!global.modularRooms.has(roomId)){
+      global.modularRooms.set(roomId, {gameId, players:[], pot:0, bets:{}, board: gameId==='caro'?Array(15).fill(0).map(()=>Array(15).fill('')):null, currentTurn:null});
+    }
+    const mRoom = global.modularRooms.get(roomId);
+    if(!mRoom.players.find(p=>p.userId===userId)){
+      const username = await getUsernameById(userId) || 'Người chơi';
+      mRoom.players.push({socketId:socket.id, userId, username, joinedAt:Date.now()});
+    }
+    // Caro: 2 người bắt đầu
+    if(gameId==='caro' && mRoom.players.length===2){
+      mRoom.currentTurn = mRoom.players[0].socketId;
+      mRoom.symbols = {[mRoom.players[0].socketId]:'X', [mRoom.players[1].socketId]:'O'};
+      io.to(roomId).emit('modular-start', {gameId, roomId, players:mRoom.players, symbols:mRoom.symbols, currentTurn:mRoom.currentTurn, pot:mRoom.pot});
+      // gửi riêng symbol
+      mRoom.players.forEach(p=>{
+        io.to(p.socketId).emit('caro-start', {gameId, roomId, symbol:mRoom.symbols[p.socketId], opponent:mRoom.players.find(x=>x.socketId!==p.socketId), pot:mRoom.pot});
+      });
+    }
+    // Bau cua: cập nhật phòng
+    if(gameId==='baucua'){
+      io.to(roomId).emit('baucua-room-update', {roomId, players:mRoom.players, pot:mRoom.pot, bets:mRoom.bets});
+    }
+    io.to(roomId).emit('modular-players-update', {roomId, gameId, players:mRoom.players});
+  });
+
+  socket.on('modular-bet', async ({roomId, gameId, userId, amount, bets})=>{
+    try{
+      if(!roomId||!gameId||!userId||!amount) return;
+      // trừ tiền chung ví
+      const result = await deductBalanceSupabase(userId, amount, gameId, roomId, `Cược ${amount} ${gameId} phòng ${roomId}`);
+      const mRoom = global.modularRooms.get(roomId);
+      if(mRoom){
+        mRoom.bets[userId] = {amount, bets: bets||{}, userId};
+        mRoom.pot = Object.values(mRoom.bets).reduce((a,b)=>a+Number(b.amount||0),0);
+        io.to(roomId).emit('modular-bet-update', {roomId, gameId, bets:mRoom.bets, pot:mRoom.pot, userId, balance: result.balance, demo_balance: result.demo_balance});
+        io.to(roomId).emit('baucua-pot-update', {pot:mRoom.pot, bets:mRoom.bets});
+      }
+      socket.emit('bet-result', {ok:true, balance:result.balance, demo_balance:result.demo_balance, amount});
+    }catch(e){
+      socket.emit('bet-result', {ok:false, error:e.message});
+      socket.emit('modular-error', {error:e.message});
+    }
+  });
+
+  socket.on('caro-move', async ({roomId, r, c, userId})=>{
+    const mRoom = global.modularRooms?.get(roomId);
+    if(!mRoom||mRoom.gameId!=='caro') return;
+    if(mRoom.currentTurn && mRoom.currentTurn!==socket.id) return;
+    if(mRoom.board[r][c]!=='') return;
+    const symbol = mRoom.symbols[socket.id];
+    mRoom.board[r][c]=symbol;
+    const win = checkCaroWin(mRoom.board, r, c);
+    const draw = mRoom.board.flat().every(v=>v!=='');
+    io.to(roomId).emit('caro-move-made', {roomId, r, c, symbol, playerId:socket.id, userId});
+
+    if(win||draw){
+      const pot = mRoom.pot || (mRoom.players.length*5000);
+      if(win){
+        const winner = mRoom.players.find(p=>p.socketId===socket.id);
+        if(winner){
+          const reward = Math.floor(pot*0.9) || 9000; // 90% pot
+          try{
+            await addRewardSupabase(winner.userId, reward, 'caro', roomId, `Thắng Caro ${reward} xu phòng ${roomId}`, false);
+          }catch{}
+          io.to(roomId).emit('caro-game-end', {roomId, winner:winner, symbol, pot, reward, reason:'win'});
+        }
+      }else{
+        // hòa hoàn tiền
+        for(const p of mRoom.players){
+          const b = mRoom.bets[p.userId]?.amount || 5000;
+          try{ await addRewardSupabase(p.userId, b, 'caro', roomId, `Hòa Caro hoàn ${b}`, true); }catch{}
+        }
+        io.to(roomId).emit('caro-game-end', {roomId, winner:null, reason:'draw', pot});
+      }
+      // reset sau 5s
+      setTimeout(()=>{ if(global.modularRooms.has(roomId)){ const rm=global.modularRooms.get(roomId); rm.board=Array(15).fill(0).map(()=>Array(15).fill('')); rm.currentTurn=rm.players[0]?.socketId; rm.pot=0; rm.bets={}; }}, 5000);
+    }else{
+      const other = mRoom.players.find(p=>p.socketId!==socket.id);
+      if(other) mRoom.currentTurn = other.socketId;
+      io.to(roomId).emit('caro-turn-change', {roomId, currentTurn:mRoom.currentTurn});
+    }
+  });
+
+  socket.on('baucua-shake', async ({roomId, userId})=>{
+    const mRoom = global.modularRooms?.get(roomId);
+    if(!mRoom||mRoom.gameId!=='baucua') return;
+    const ANIMALS=['bau','cua','tom','ca','nai','ga'];
+    const result=[ANIMALS[Math.floor(Math.random()*6)], ANIMALS[Math.floor(Math.random()*6)], ANIMALS[Math.floor(Math.random()*6)]];
+    mRoom.lastResult=result;
+    const counts={}; result.forEach(id=>counts[id]=(counts[id]||0)+1);
+    // tính thưởng từng người
+    for(const pid of Object.keys(mRoom.bets)){
+      const betData = mRoom.bets[pid];
+      let win=0;
+      if(betData.bets){
+        for(const [animal, amt] of Object.entries(betData.bets)){
+          const cnt=counts[animal]||0;
+          if(cnt>0) win+= Number(amt) + Number(amt)*cnt;
+        }
+      }else{
+        // bet đơn giản: đặt vào 1 con
+        const animal = betData.animal || 'bau';
+        const cnt=counts[animal]||0;
+        if(cnt>0) win+= betData.amount + betData.amount*cnt;
+      }
+      if(win>0){
+        try{ await addRewardSupabase(pid, win, 'baucua', roomId, `Thắng Bầu Cua ${win} - ${result.join(',')}`, false); }catch{}
+        const playerSocket = mRoom.players.find(p=>p.userId===pid);
+        if(playerSocket) io.to(playerSocket.socketId).emit('baucua-result-private', {result, win, counts});
+      }
+    }
+    io.to(roomId).emit('baucua-result', {roomId, result, counts, pot:mRoom.pot});
+    mRoom.bets={}; mRoom.pot=0;
+  });
+
+  socket.on('modular-leave', ({roomId, userId})=>{
+    const mRoom = global.modularRooms?.get(roomId);
+    if(mRoom){
+      mRoom.players = mRoom.players.filter(p=>p.userId!==userId);
+      if(mRoom.players.length===0) global.modularRooms.delete(roomId);
+      else io.to(roomId).emit('modular-players-update', {roomId, players:mRoom.players});
+    }
+  });
+
+  function checkCaroWin(board, r, c){
+    const dirs=[[0,1],[1,0],[1,1],[1,-1]];
+    for(let [dr,dc] of dirs){
+      let count=1;
+      for(let i=1;i<5;i++){ let nr=r+dr*i,nc=c+dc*i; if(nr<0||nr>=15||nc<0||nc>=15||board[nr][nc]!==board[r][c]) break; count++; }
+      for(let i=1;i<5;i++){ let nr=r-dr*i,nc=c-dc*i; if(nr<0||nr>=15||nc<0||nc>=15||board[nr][nc]!==board[r][c]) break; count++; }
+      if(count>=5) return true;
+    }
+    return false;
+  }
+
+  // ===================== END MODULAR GAMES SOCKET =====================
+
 
   socket.on('create-solo', async ({userId, botCount, betAmount, ticket, ticketColor, isDemo})=>{
     const roomId = 'SOLO-'+nanoid(6).toUpperCase();
@@ -2562,7 +2631,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         userId,
         username: chatUsername || 'Người chơi',
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
       };
       socket.to(roomId).emit('chat-message', chatData);
     }catch(e){ console.log('send-chat error', e.message); }
@@ -2590,7 +2659,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         toUserId,
         toUsername: receiverName,
         text: cleanText,
-        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'}),
+        timestamp: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'}),
         messageId: Date.now() + '_' + fromUserId
       };
       
@@ -2657,7 +2726,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
         senderId,
         messageIds: messageIds || [],
         timestamp: Date.now(),
-        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone:'Asia/Ho_Chi_Minh'})
+        readAt: new Date().toLocaleTimeString('vi-VN', {hour:'2-digit', minute:'2-digit', timeZone: 'Asia/Ho_Chi_Minh'})
       };
       
       // Gửi cho người gửi để hiện "Đã xem"
@@ -3263,133 +3332,61 @@ setTimeout(cleanupEmptyRooms, 10000);
 
 
 
-// ===== MULTI-GAME API - Load games from Drive via Apps Script =====
-const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL_GAMES || 'https://script.google.com/macros/s/AKfycbxHLDsmPgdIhjVwCgkzDmot0TzcNfss2P1DWA6EcyLVEL1CVC0dTZpdBV4_p29Rc7sx/exec';
-
-async function fetchFromAppsScript(action, params={}){
+// ===== MODULAR GAMES API - DÙNG CHUNG VÍ =====
+app.get('/api/modules/list', async (req,res)=>{
   try{
-    const url = new URL(APPSCRIPT_GAMES_URL);
-    url.searchParams.set('action', action);
-    for(const [k,v] of Object.entries(params)){
-      url.searchParams.set(k, v);
-    }
-    console.log('[GAMES] Fetching from Apps Script:', url.toString().substring(0,150));
-    const resp = await fetch(url.toString());
-    const txt = await resp.text();
-    try{
-      return JSON.parse(txt);
-    }catch(e){
-      // If it's HTML directly
-      if(action==='get' || action==='html'){
-        return {ok:true, html:txt};
-      }
-      return {ok:false, error:'Invalid JSON: '+txt.substring(0,200)};
-    }
-  }catch(e){
-    console.error('[GAMES] Apps Script fetch error:', e.message);
-    return {ok:false, error:e.message};
-  }
-}
-
-// List all games
-app.get('/api/games', async (req,res)=>{
+    const games = await fetchGameModulesFromDrive();
+    res.json({ok:true, games, count: games.length, timestamp:new Date().toISOString()});
+  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
+});
+app.post('/api/modules/refresh', async(req,res)=>{
+  cachedGameList=null; cachedGameListTime=0;
+  const games = await fetchGameModulesFromDrive();
+  res.json({ok:true, games});
+});
+app.get('/api/modules/:id', async(req,res)=>{
+  const {id}=req.params;
+  if(id==='loto') return res.json({ok:true, isBuiltIn:true, id:'loto'});
   try{
-    // Built-in Loto luôn có
-    const builtinGames = [
-      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto truyền thống 90 số - Vé đỏ, chơi với bot hoặc phòng riêng', icon:'🎲', iconUrl:'', color:'#FFD700', bgGradient:'linear-gradient(135deg, #FFD700, #FFA500)', game_type:'loto', gameType:'loto', isBuiltIn:true, maxPlayers:10, version:'1.0', modifiedTime:new Date().toISOString()}
-    ];
-    
-    const result = await fetchFromAppsScript('list');
-    if(result && result.ok && result.games && result.games.length>0){
-      // Merge, đảm bảo Loto ở đầu
-      const hasLoto = result.games.some(g=>g.id==='loto' || g.game_type==='loto');
-      const allGames = hasLoto ? result.games : [...builtinGames, ...result.games];
-      res.json({ok:true, games:allGames, count:allGames.length, source:'appscript'});
-    }else{
-      // Fallback chỉ có Loto
-      res.json({ok:true, games:builtinGames, count:builtinGames.length, source:'builtin', warning: result ? result.error : 'No games from Apps Script'});
-    }
-  }catch(e){
-    console.error('/api/games error', e);
-    res.status(500).json({ok:false, error:e.message, games:[
-      {id:'loto', fileId:'loto', name:'Loto Online', description:'Loto 90 số', icon:'🎲', game_type:'loto', isBuiltIn:true}
-    ]});
-  }
+    const html = await loadGameHtmlFromDrive(id);
+    if(!html) return res.status(404).json({ok:false, error:'Game not found'});
+    res.json({ok:true, fileId:id, html, size: html.length});
+  }catch(e){ res.status(500).json({ok:false, error:e.message}); }
+});
+app.get('/api/modules/:id/raw', async(req,res)=>{
+  const {id}=req.params;
+  if(id==='loto') return res.status(400).send('Built-in game');
+  let html = await loadGameHtmlFromDrive(id);
+  if(!html) return res.status(404).send('Game not found: '+id);
+  html = injectWalletBridgeForSupabase(html, id);
+  res.set('Content-Type','text/html'); res.send(html);
 });
 
-// Get game info
-app.get('/api/games/:fileId/info', async (req,res)=>{
+// ===== WALLET API DÙNG CHUNG CHO MỌI GAME MODULE =====
+app.post('/api/game/bet', async(req,res)=>{
+  const {userId, gameId, amount, roomId, description, isDemo} = req.body;
+  if(!userId||!amount) return res.status(400).json({ok:false, error:'Missing userId/amount'});
   try{
-    const fileId = req.params.fileId;
-    if(fileId==='loto'){
-      return res.json({ok:true, game:{id:'loto', name:'Loto Online', isBuiltIn:true}});
-    }
-    const result = await fetchFromAppsScript('info', {fileId});
-    res.json(result);
-  }catch(e){
-    res.status(500).json({ok:false, error:e.message});
-  }
+    const result = await deductBalanceSupabase(userId, amount, gameId, roomId, description||`Cược ${amount} ${gameId}`);
+    res.json({ok:true, ...result});
+  }catch(e){ res.status(400).json({ok:false, error:e.message}); }
 });
-
-// Get game HTML - quan trọng nhất để chơi game từ Drive
-app.get('/api/games/:fileId/html', async (req,res)=>{
+app.post('/api/game/reward', async(req,res)=>{
+  const {userId, gameId, amount, roomId, description, isDemo} = req.body;
+  if(!userId||!amount) return res.status(400).json({ok:false});
   try{
-    const fileId = req.params.fileId;
-    if(!fileId) return res.status(400).send('Missing fileId');
-    
-    if(fileId==='loto'){
-      return res.status(400).json({ok:false, error:'Loto is built-in, no HTML file'});
-    }
-    
-    console.log('[GAMES] Request HTML for fileId:', fileId);
-    const result = await fetchFromAppsScript('get', {fileId, format:'raw'});
-    
-    // Apps Script có thể trả về JSON bọc HTML hoặc HTML trực tiếp
-    let html = '';
-    if(result && result.html){
-      html = result.html;
-    }else if(typeof result === 'string' && result.includes('<')){
-      html = result;
-    }else if(result && result.ok===false && result.html){
-      html = result.html;
-    }else{
-      // Thử fetch trực tiếp với action=get không format
-      const directResult = await fetchFromAppsScript('get', {fileId});
-      if(directResult && directResult.html){
-        html = directResult.html;
-      }else if(typeof directResult === 'string' && directResult.includes('<')){
-        html = directResult;
-      }else{
-        return res.status(404).json({ok:false, error:'Game HTML not found', details: result});
-      }
-    }
-    
-    // Trả về HTML trực tiếp để iframe có thể load
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.send(html);
-    
-  }catch(e){
-    console.error('/api/games/:fileId/html error', e);
-    res.status(500).json({ok:false, error:e.message});
-  }
+    // Anti-hack: giới hạn reward không vượt quá bet*5 nếu không có roomId hợp lệ
+    let finalAmount = Number(amount);
+    if(!roomId && finalAmount>50000) finalAmount = 50000;
+    const result = await addRewardSupabase(userId, finalAmount, gameId, roomId, description||`Thắng ${finalAmount} ${gameId}`, isDemo);
+    res.json({ok:true, ...result, amount:finalAmount});
+  }catch(e){ res.status(400).json({ok:false, error:e.message}); }
 });
-
-app.get('/api/games/:fileId/download', async (req,res)=>{
-  try{
-    const fileId = req.params.fileId;
-    const result = await fetchFromAppsScript('get', {fileId});
-    if(result && result.html){
-      res.setHeader('Content-Disposition', 'attachment; filename="' + fileId + '.html"');
-      res.setHeader('Content-Type', 'text/html');
-      res.send(result.html);
-    }else{
-      res.status(404).json({ok:false, error:'File not found'});
-    }
-  }catch(e){
-    res.status(500).json({ok:false, error:e.message});
-  }
+app.get('/api/game/history/:userId', async(req,res)=>{
+  const {userId}=req.params;
+  const {data} = await supabase.from('transactions').select('*').eq('user_id', userId).order('created_at',{ascending:false}).limit(30);
+  res.json({ok:true, history: data||[]});
 });
-
 
 
 app.get('/', (req,res)=> res.send('Loto Online Backend Running - Demo Balance + Withdraw + Admin System - Updated Demo Win Logic'));

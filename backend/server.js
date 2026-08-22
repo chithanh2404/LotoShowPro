@@ -880,6 +880,46 @@ app.get('/api/tickets/generate', (req,res)=>{
   res.json({tickets});
 });
 
+app.post('/api/rooms/create', async (req,res)=>{
+  console.log('[ROOMS] POST /api/rooms/create called', req.body);
+  // Alias for /api/rooms - forward to same logic
+  req.url = '/api/rooms';
+  // Reuse same handler by calling next? Simpler: duplicate logic or redirect
+  // We'll just handle it here with same code
+  try{
+    const {hostId, name, password, betAmount, maxPlayers, isDemo, gameType, gameId, roomId} = req.body;
+    console.log('[ROOMS] Creating room via /create alias', {hostId, name, betAmount, gameType});
+    // Generate room ID if not provided
+    const finalRoomId = roomId || ('CARO-' + Math.random().toString(36).substr(2,6).toUpperCase());
+    // Create room logic (simplified - will be handled by existing POST /api/rooms logic if we call it)
+    // For now, just return success and let client handle
+    // Actually, let's call the same supabase insert as in POST /api/rooms
+    const {data, error} = await supabase.from('rooms').insert({
+      id: finalRoomId,
+      host_id: hostId,
+      name: name || 'Caro Vip',
+      password: password || null,
+      bet_amount: betAmount || 10000,
+      max_players: maxPlayers || 8,
+      is_demo: isDemo || false,
+      game_type: gameType || 'caro',
+      game_id: gameId || 'caro',
+      status: 'waiting',
+      created_at: new Date().toISOString()
+    }).select().single();
+    
+    if(error){
+      console.error('[ROOMS] Create error', error);
+      return res.status(500).json({ok:false, error:error.message});
+    }
+    
+    res.json({ok:true, id: finalRoomId, room: data, roomId: finalRoomId});
+  }catch(e){
+    console.error('[ROOMS] /create error', e);
+    res.status(500).json({ok:false, error:e.message});
+  }
+});
+
 app.post('/api/rooms', async (req,res)=>{
   const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo, gameType, gameId: reqGameId, roomId: reqRoomId} = req.body;
     let prefix = 'LOTO-';

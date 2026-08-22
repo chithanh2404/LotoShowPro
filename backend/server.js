@@ -41,8 +41,8 @@ const GAME_LIST_TTL = 5*60*1000;
 async function fetchGameModulesFromDrive(){
   if(cachedGameList && (Date.now()-cachedGameListTime)<GAME_LIST_TTL) return cachedGameList;
   try{
-    const url = process.env.APPSCRIPT_URL;
-    if(!url) throw new Error('Missing APPSCRIPT_URL');
+    const url = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL; // ưu tiên GAMES_URL cho game module
+    if(!url) throw new Error('Missing APPSCRIPT_URL / APPSCRIPT_GAMES_URL');
     const resp = await fetch(url + '?action=modules');
     const data = await resp.json();
     if(data && data.ok && data.games){
@@ -70,7 +70,7 @@ async function fetchGameModulesFromDrive(){
 // Load HTML game từ Drive
 async function loadGameHtmlFromDrive(fileId){
   try{
-    const url = process.env.APPSCRIPT_URL;
+    const url = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL; // ưu tiên GAMES_URL cho game module
     const resp = await fetch(url + `?action=get&fileId=${fileId}&format=json`);
     const data = await resp.json();
     if(data && data.ok && data.html) return data.html;
@@ -186,7 +186,8 @@ async function addRewardSupabase(userId, amount, gameId, roomId, description, is
 
 
 
-const APPSCRIPT_URL = process.env.APPSCRIPT_URL;
+const APPSCRIPT_URL = process.env.APPSCRIPT_URL; // OTP URL - giữ nguyên để gửi OTP
+const APPSCRIPT_GAMES_URL = process.env.APPSCRIPT_GAMES_URL || process.env.APPSCRIPT_URL; // Games URL
 
 // Helper lay username tu profiles
 async function getUsernameById(userId){

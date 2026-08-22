@@ -662,7 +662,23 @@ app.post('/api/wallet/bet', async (req,res)=>{
       });
     }catch(hErr){ console.log('game_history log error', hErr.message); }
     console.log(`[WALLET] ${userId} bet ${amt} (${useDemo ? 'demo' : 'real'}) in ${gameType}/${gameId}. New balance: ${newBalance}`);
-    res.json({ok:true, newBalance, deducted: amt, mode: useDemo ? 'demo' : 'real', message:`Đã cược ${amt.toLocaleString()} xu`});
+    // Lấy lại profile để trả về cả 2 số dư
+    try{
+      const updatedProfile = await getProfileById(userId);
+      res.json({
+        ok:true, 
+        newBalance, 
+        deducted: amt, 
+        mode: useDemo ? 'demo' : 'real', 
+        realBalance: updatedProfile ? (updatedProfile.balance || 0) : (useDemo ? currentBalance : newBalance),
+        demoBalance: updatedProfile ? (updatedProfile.demo_balance || 0) : (useDemo ? newBalance : currentBalance),
+        real_balance: updatedProfile ? (updatedProfile.balance || 0) : 0,
+        demo_balance: updatedProfile ? (updatedProfile.demo_balance || 0) : 0,
+        message:`Đã cược ${amt.toLocaleString()} xu`
+      });
+    }catch(e){
+      res.json({ok:true, newBalance, deducted: amt, mode: useDemo ? 'demo' : 'real', message:`Đã cược ${amt.toLocaleString()} xu`});
+    }
   }catch(e){ console.error('/api/wallet/bet error', e); res.status(500).json({ok:false, error:e.message}); }
 });
 

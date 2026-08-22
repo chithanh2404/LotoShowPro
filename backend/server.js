@@ -1338,11 +1338,29 @@ io.on('connection', (socket)=>{
       return socket.emit('error','Phòng đã đầy ('+maxPlayersAllowed+' người)! Vui lòng chọn phòng khác.');
     }
     if(!existList || existList.length===0){
-      const finalTicket = ticket || generateLotoTicket();
+      const isLotoRoom = !room.game_type || room.game_type.toLowerCase()==='loto' || roomId.toUpperCase().startsWith('LOTO-');
+      const finalTicket = isLotoRoom ? (ticket || generateLotoTicket()) : (ticket || null);
       const username = await getUsernameById(userId);
       const color = ticketColor || '#'+Math.floor(Math.random()*16777215).toString(16);
       const is_demo = !!isDemo;
-      await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: finalTicket, ticket_color: color, is_bot:false, is_demo});
+      const insertData = {room_id:roomId, user_id:userId, username: username, ticket: finalTicket, ticket_color: color, is_bot:false, is_demo};
+      // For non-loto, allow null ticket if table requires it, try without ticket field if needed
+      try{
+        await supabase.from('room_players').insert(insertData);
+      }catch(e){
+        // Fallback: if ticket column not nullable for non-loto, try with empty array or minimal
+        console.log('[JOIN-ROOM] Insert failed, trying fallback', e.message);
+        const fallback = {...insertData};
+        if(!isLotoRoom) delete fallback.ticket;
+        try{
+          await supabase.from('room_players').insert(fallback);
+        }catch(e2){
+          // last fallback with ticket as empty
+          fallback.ticket = ticket || [];
+          await supabase.from('room_players').insert(fallback);
+        }
+      }
+
     } else if(existList.length>1){
       for(let i=1;i<existList.length;i++){
         await supabase.from('room_players').delete().eq('id', existList[i].id);

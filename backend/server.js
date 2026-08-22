@@ -882,37 +882,54 @@ app.get('/api/tickets/generate', (req,res)=>{
 
 app.post('/api/rooms/create', async (req,res)=>{
   console.log('[ROOMS] POST /api/rooms/create called', req.body);
-  // Alias for /api/rooms - forward to same logic
-  req.url = '/api/rooms';
-  // Reuse same handler by calling next? Simpler: duplicate logic or redirect
-  // We'll just handle it here with same code
   try{
     const {hostId, name, password, betAmount, maxPlayers, isDemo, gameType, gameId, roomId} = req.body;
-    console.log('[ROOMS] Creating room via /create alias', {hostId, name, betAmount, gameType});
-    // Generate room ID if not provided
-    const finalRoomId = roomId || ('CARO-' + Math.random().toString(36).substr(2,6).toUpperCase());
-    // Create room logic (simplified - will be handled by existing POST /api/rooms logic if we call it)
-    // For now, just return success and let client handle
-    // Actually, let's call the same supabase insert as in POST /api/rooms
-    const {data, error} = await supabase.from('rooms').insert({
-      id: finalRoomId,
-      host_id: hostId,
-      name: name || 'Caro Vip',
-      password: password || null,
-      bet_amount: betAmount || 10000,
-      max_players: maxPlayers || 8,
-      is_demo: isDemo || false,
-      game_type: gameType || 'caro',
-      game_id: gameId || 'caro',
+    console.log('[ROOMS] Creating room via /create alias', {hostId, name, betAmount, gameType, gameId, isDemo});
+    
+    let prefix = 'CARO-';
+    const gt = (gameId || gameType || '').toLowerCase();
+    if(gt.includes('caro')) prefix='CARO-';
+    else if(gt.includes('taixiu')||gt.includes('tai_xiu')) prefix='TAIXIU-';
+    else if(gt.includes('baucua')||gt.includes('bau_cua')) prefix='BAUCUA-';
+    else if(gt.includes('xocdia')||gt.includes('xoc_dia')) prefix='XOCDIA-';
+    else if(gt) prefix = gt.toUpperCase().substring(0,6)+'-';
+    
+    const finalRoomId = roomId || (prefix + Math.random().toString(36).substr(2,6).toUpperCase());
+    const fee = 20;
+    
+    // Dùng đúng cột có trong bảng rooms (không có is_demo)
+    // Bảng rooms có: id, name, host_id, password, bet_amount, max_players, status, fee_percent, game_id, game_type, game_name, current_numbers, winner_id
+    let roomInsertData = {
+      id: finalRoomId, 
+      name: name || 'Caro Vip', 
+      host_id: hostId, 
+      password: password||null, 
+      bet_amount: betAmount || 10000, 
+      max_players: maxPlayers||8, 
+      fee_percent: fee, 
       status: 'waiting',
-      created_at: new Date().toISOString()
-    }).select().single();
+      game_id: gameId || gameType || 'caro',
+      game_type: gameType || gameId || 'caro',
+      game_name: (gameType || gameId || 'caro').toUpperCase() + ' Online'
+    };
+    
+    console.log('[ROOMS] Insert data', roomInsertData);
+    let {data, error} = await supabase.from('rooms').insert(roomInsertData).select().single();
+    
+    if(error && error.message && error.message.includes('game_type')){
+      console.log('[ROOMS] game_type column not exists, fallback without it');
+      const {game_type, ...fallbackData} = roomInsertData;
+      const result = await supabase.from('rooms').insert(fallbackData).select().single();
+      data = result.data;
+      error = result.error;
+    }
     
     if(error){
       console.error('[ROOMS] Create error', error);
-      return res.status(500).json({ok:false, error:error.message});
+      return res.status(500).json({ok:false, error:error.message, details:error});
     }
     
+    console.log('[ROOMS] Created room', finalRoomId);
     res.json({ok:true, id: finalRoomId, room: data, roomId: finalRoomId});
   }catch(e){
     console.error('[ROOMS] /create error', e);

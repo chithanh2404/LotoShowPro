@@ -933,21 +933,84 @@ app.get('/api/tickets/generate', (req,res)=>{
 });
 
 app.post('/api/rooms', async (req,res)=>{
-  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo} = req.body;
-  const id = 'LOTO-'+nanoid(6).toUpperCase();
-  const fee = 20;
-  const {data, error} = await supabase.from('rooms').insert({id, name, host_id:hostId, password: password||null, bet_amount:betAmount, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'}).select().single();
-  if(error) return res.status(500).json({error});
-  const finalTicket = ticket || generateLotoTicket();
+  const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo, gameType, gameId, roomId} = req.body;
+  const isCaro = (gameType==='caro' || gameId==='caro' || (name&&name.toLowerCase().includes('caro')) || (roomId&&roomId.startsWith('CARO-')));
+  const id = roomId || (isCaro ? 'CARO-'+nanoid(6).toUpperCase() : 'LOTO-'+nanoid(6).toUpperCase());
+  const fee = isCaro ? 10 : 20;
+  // Check if room already exists (for custom roomId)
+  try{
+    const {data: existing} = await supabase.from('rooms').select('id').eq('id', id).single();
+    if(existing){
+      return res.json(existing);
+    }
+  }catch(e){}
+  const {data, error} = await supabase.from('rooms').insert({id, name: name||id, host_id:hostId, password: password||null, bet_amount:betAmount||0, max_players:maxPlayers||10, fee_percent:fee, status:'waiting', game_type: isCaro ? 'caro' : 'loto'}).select().single();
+  if(error){
+    // fallback if game_type column doesn't exist
+    const {data: data2, error: error2} = await supabase.from('rooms').insert({id, name: name||id, host_id:hostId, password: password||null, bet_amount:betAmount||0, max_players:maxPlayers||10, fee_percent:fee, status:'waiting'}).select().single();
+    if(error2) return res.status(500).json({error: error2});
+    // continue with data2
+    const username = await getUsernameById(hostId);
+    const ticketColor = req.body.ticketColor || '#00d2ff';
+    const is_demo = !!isDemo;
+    if(!isCaro){
+      const finalTicket = ticket || generateLotoTicket();
+      await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
+    }else{
+      await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: null, ticket_color: ticketColor||'#ff6b35', is_bot:false, is_demo});
+      // init modular room for caro
+      if(!global.modularRooms) global.modularRooms = new Map();
+      global.modularRooms.set(id, {gameId:'caro', players:[{socketId:null, userId:hostId, username, isHost:true}], pot: betAmount||0, bets:{[hostId]:{amount:betAmount||0}}, board: Array(15).fill(0).map(()=>Array(15).fill('')), currentTurn:null, status:'waiting', betAmount: betAmount||0, isDemo: is_demo});
+    }
+    roomHosts.set(id, hostId);
+    roomReadyStates.set(id, new Map());
+    return res.json(data2);
+  }
   const username = await getUsernameById(hostId);
-  const ticketColor = req.body.ticketColor || '#00d2ff';
+  const ticketColor = req.body.ticketColor || (isCaro ? '#ff6b35' : '#00d2ff');
   const is_demo = !!isDemo;
-  await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
-  // Cache host
+  if(!isCaro){
+    const finalTicket = ticket || generateLotoTicket();
+    await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
+  }else{
+    await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: null, ticket_color: ticketColor, is_bot:false, is_demo});
+    if(!global.modularRooms) global.modularRooms = new Map();
+    global.modularRooms.set(id, {gameId:'caro', players:[{socketId:null, userId:hostId, username, isHost:true}], pot: betAmount||0, bets:{[hostId]:{amount:betAmount||0}}, board: Array(15).fill(0).map(()=>Array(15).fill('')), currentTurn:null, status:'waiting', betAmount: betAmount||0, isDemo: is_demo});
+  }
   roomHosts.set(id, hostId);
   roomReadyStates.set(id, new Map());
   res.json(data);
 });
+
+// Alias for /api/rooms/create for Caro V3
+app.post('/api/rooms/create', async (req,res)=>{
+  req.body.hostId = req.body.hostId || req.body.host_id || req.body.userId;
+  // forward to /api/rooms handler logic
+  const {hostId, name, password, betAmount, maxPlayers, isDemo, gameType, gameId, roomId} = req.body;
+  const isCaro = true;
+  const id = roomId || 'CARO-'+nanoid(6).toUpperCase();
+  const fee = 10;
+  try{
+    const {data: existing} = await supabase.from('rooms').select('*').eq('id', id).single();
+    if(existing) return res.json(existing);
+  }catch(e){}
+  const {data, error} = await supabase.from('rooms').insert({id, name: name||id, host_id:hostId, password: password||null, bet_amount:betAmount||0, max_players:maxPlayers||8, fee_percent:fee, status:'waiting', game_type:'caro'}).select().single();
+  if(error){
+    const {data: data2, error: error2} = await supabase.from('rooms').insert({id, name: name||id, host_id:hostId, password: password||null, bet_amount:betAmount||0, max_players:maxPlayers||8, fee_percent:fee, status:'waiting'}).select().single();
+    if(error2) return res.status(500).json({error: error2});
+    const username = await getUsernameById(hostId);
+    await supabase.from('room_players').insert({room_id:id, user_id:hostId, username, ticket: null, ticket_color: '#ff6b35', is_bot:false, is_demo: !!isDemo});
+    if(!global.modularRooms) global.modularRooms = new Map();
+    global.modularRooms.set(id, {gameId:'caro', players:[{userId:hostId, username, isHost:true}], pot: betAmount||0, bets:{}, board: Array(15).fill(0).map(()=>Array(15).fill('')), status:'waiting', betAmount});
+    return res.json(data2);
+  }
+  const username = await getUsernameById(hostId);
+  await supabase.from('room_players').insert({room_id:id, user_id:hostId, username, ticket: null, ticket_color: '#ff6b35', is_bot:false, is_demo: !!isDemo});
+  if(!global.modularRooms) global.modularRooms = new Map();
+  global.modularRooms.set(id, {gameId:'caro', players:[{userId:hostId, username, isHost:true}], pot: betAmount||0, bets:{}, board: Array(15).fill(0).map(()=>Array(15).fill('')), status:'waiting', betAmount});
+  res.json(data);
+});
+
 
 app.get('/api/rooms', async (req,res)=>{
   try{
@@ -3382,6 +3445,55 @@ app.post('/api/game/reward', async(req,res)=>{
     res.json({ok:true, ...result, amount:finalAmount});
   }catch(e){ res.status(400).json({ok:false, error:e.message}); }
 });
+
+// ===== WALLET API ALIASES FOR CARO V3 (compat) =====
+app.get('/api/profile/:userId', async (req,res)=>{
+  try{
+    const {userId}=req.params;
+    const {data, error} = await supabase.from('profiles').select('*').eq('id', userId).single();
+    if(error) return res.status(404).json({error:error.message});
+    res.json(data);
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
+app.post('/api/wallet/bet', async (req,res)=>{
+  const {userId, amount, mode, gameId, roomId, description} = req.body;
+  const betAmount = Number(amount);
+  if(!userId||!betAmount) return res.status(400).json({ok:false, error:'Missing userId/amount'});
+  try{
+    // mode real/demo
+    const isDemo = (mode==='demo');
+    const result = await deductBalanceSupabase(userId, betAmount, gameId||'caro', roomId, description||`Cược ${betAmount} ${gameId||'caro'}`);
+    // result already contains balance, demo_balance
+    // adjust to return newBalance based on mode
+    const newBalance = isDemo ? result.demo_balance : result.balance;
+    res.json({ok:true, ...result, newBalance, balance: result.balance, demo_balance: result.demo_balance, demoBalance: result.demo_balance, realBalance: result.balance});
+  }catch(e){ res.status(400).json({ok:false, error:e.message}); }
+});
+
+app.post('/api/wallet/win', async (req,res)=>{
+  const {userId, amount, mode, gameId, roomId, description} = req.body;
+  const winAmount = Number(amount);
+  if(!userId||!winAmount) return res.status(400).json({ok:false});
+  try{
+    const isDemo = (mode==='demo');
+    let finalAmount = winAmount;
+    if(!roomId && finalAmount>50000) finalAmount = 50000;
+    const result = await addRewardSupabase(userId, finalAmount, gameId||'caro', roomId, description||`Thắng ${finalAmount} ${gameId||'caro'}`, isDemo);
+    const newBalance = isDemo ? result.demo_balance : result.balance;
+    res.json({ok:true, ...result, newBalance, balance: result.balance, demo_balance: result.demo_balance});
+  }catch(e){ res.status(400).json({ok:false, error:e.message}); }
+});
+
+// Alias for /api/user/balance to ensure it works
+app.get('/api/user/balance', async (req,res)=>{
+  const userId = req.query.userId;
+  if(!userId) return res.status(400).json({error:'Missing userId'});
+  const {data} = await supabase.from('profiles').select('balance, demo_balance').eq('id', userId).single();
+  if(!data) return res.status(404).json({error:'Not found'});
+  res.json({balance: data.balance||0, real_balance: data.balance||0, demo_balance: data.demo_balance||0, demoBalance: data.demo_balance||0, realBalance: data.balance||0});
+});
+
 app.get('/api/game/history/:userId', async(req,res)=>{
   const {userId}=req.params;
   const {data} = await supabase.from('transactions').select('*').eq('user_id', userId).order('created_at',{ascending:false}).limit(30);

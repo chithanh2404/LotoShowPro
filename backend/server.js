@@ -1060,7 +1060,10 @@ app.get('/api/rooms', async (req,res)=>{
         progress: progress,
         isPlaying: isPlaying,
         created_at: room.created_at,
-        host_id: room.host_id
+        host_id: room.host_id,
+        game_type: room.game_type || (room.id && room.id.includes('-') ? room.id.split('-')[0].toLowerCase() : 'loto'),
+        gameType: room.game_type || (room.id && room.id.includes('-') ? room.id.split('-')[0].toLowerCase() : 'loto'),
+        game_id: room.game_type || (room.id && room.id.includes('-') ? room.id.split('-')[0].toLowerCase() : 'loto')
       });
     }
     

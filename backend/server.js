@@ -940,7 +940,7 @@ app.post('/api/rooms', async (req,res)=>{
   const {hostId, name, password, betAmount, maxPlayers, ticket, isDemo, gameType, gameId, roomId} = req.body;
   const isCaro = (gameType==='caro' || gameId==='caro' || (name&&name.toLowerCase().includes('caro')) || (roomId&&roomId.startsWith('CARO-')));
   const id = roomId || (isCaro ? 'CARO-'+nanoid(6).toUpperCase() : 'LOTO-'+nanoid(6).toUpperCase());
-  const fee = isCaro ? 10 : 20;
+  const fee = isCaro ? 10 : 6;
   // Check if room already exists (for custom roomId)
   try{
     const {data: existing} = await supabase.from('rooms').select('id').eq('id', id).single();
@@ -1081,7 +1081,7 @@ app.get('/api/rooms', async (req,res)=>{
         totalPlayers: totalPlayers,
         maxPlayers: 10, // ép tất cả phòng lên 10 người
         bet_amount: room.bet_amount || room.bet || 0,
-        fee: room.fee_percent || room.fee || 20,
+        fee: room.fee_percent || room.fee || 6,
         status: room.status || 'waiting',
         drawnCount: drawnCount,
         progress: progress,

@@ -147,18 +147,22 @@ async function deductBalanceSupabase(userId, amount, gameId, roomId, description
   const {data: prof} = await supabase.from('profiles').select('balance, demo_balance, total_wagered').eq('id', userId).single();
   if(!prof) throw new Error('Profile not found');
   let newBal = prof.balance||0, newDemo = prof.demo_balance||0, deductedFrom='demo';
+  let wagerToAdd = 0;
   if(newDemo >= amount){
     newDemo -= amount;
-    await supabase.from('profiles').update({demo_balance:newDemo, total_wagered:(prof.total_wagered||0)+amount}).eq('id', userId);
+    // FIX: demo không tính vào tiến độ cược rút tiền
+    await supabase.from('profiles').update({demo_balance:newDemo}).eq('id', userId);
   }else if((prof.balance||0) >= amount){
     newBal -= amount; deductedFrom='real';
-    await supabase.from('profiles').update({balance:newBal, total_wagered:(prof.total_wagered||0)+amount}).eq('id', userId);
+    wagerToAdd = amount;
+    await supabase.from('profiles').update({balance:newBal, total_wagered:(prof.total_wagered||0)+wagerToAdd}).eq('id', userId);
   }else{
     const need = amount - newDemo;
     if((prof.balance||0) >= need){
       const demoDeduct = newDemo; newDemo=0; newBal -= need;
-      await supabase.from('profiles').update({balance:newBal, demo_balance:newDemo, total_wagered:(prof.total_wagered||0)+amount}).eq('id', userId);
+      wagerToAdd = need; // chỉ tính phần tiền thật
       deductedFrom='mixed';
+      await supabase.from('profiles').update({balance:newBal, demo_balance:newDemo, total_wagered:(prof.total_wagered||0)+wagerToAdd}).eq('id', userId);
     }else throw new Error('Không đủ xu. Bạn có '+(prof.balance+prof.demo_balance)+' xu');
   }
   await supabase.from('transactions').insert([{user_id:userId, type: deductedFrom==='real'?'lose':'lose_demo', amount:-amount, room_id:roomId, description: description||`Cược ${amount} game ${gameId}`}]);
@@ -1227,7 +1231,7 @@ async function finalizeForfeitAndKick(roomId, userId, username){
             const playerInGame = game.originalPlayers ? game.originalPlayers.find(pl=>pl.user_id===userId) : null;
             const isDemo = playerInGame ? playerInGame.is_demo : false;
             if(isDemo){
-              await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-betAmount), total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
+              await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-betAmount)}).eq('id', userId); // FIX demo không tính wager
             } else {
               if((prof.balance||0) >= betAmount){
                 await supabase.from('profiles').update({balance: prof.balance - betAmount, total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
@@ -2059,9 +2063,8 @@ io.on('connection', (socket)=>{
                 if(isDemoPlayer){
                   const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
                   await supabase.from('profiles').update({
-                    demo_balance: newDemo,
-                    total_wagered: (prof.total_wagered || 0) + bet
-                  }).eq('id', pl.user_id);
+                    demo_balance: newDemo
+                  }).eq('id', pl.user_id); // FIX demo không tính wager
                   await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo - chia pot cho ${winnersFound.length} người thắng`}]);
                 } else {
                   const newBal = (prof.balance || 0) - bet;
@@ -2083,9 +2086,8 @@ io.on('connection', (socket)=>{
                   if(isDemoWinner){
                     const newDemo = (winnerProf.demo_balance || 0) + amount;
                     await supabase.from('profiles').update({
-                      demo_balance: newDemo,
-                      total_wagered: (winnerProf.total_wagered || 0) + bet
-                    }).eq('id', p.user_id);
+                      demo_balance: newDemo
+                    }).eq('id', p.user_id); // FIX demo không tính wager
                     await supabase.from('transactions').insert([{user_id: p.user_id, type:'win_demo', amount: amount, room_id:roomId, description: `Thắng ${amount} demo - chia đều ${winnersFound.length} người cùng thắng số ${num}`}]);
                   } else {
                     await supabase.from('profiles').update({
@@ -2227,10 +2229,9 @@ io.on('connection', (socket)=>{
                   if(isDemoPlayer){
                     const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
                     await supabase.from('profiles').update({
-                      demo_balance: newDemo,
-                      total_wagered: (prof.total_wagered || 0) + bet
+                      demo_balance: newDemo
                     }).eq('id', pl.user_id);
-                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo - bot ${p.bot_name} thắng`}]);
+                    await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo - bot ${p.bot_name} thắng`}]); // FIX demo không tính wager
                   } else {
                     const newBal = (prof.balance || 0) - bet;
                     await supabase.from('profiles').update({
@@ -2256,9 +2257,8 @@ io.on('connection', (socket)=>{
                   if(isDemoPlayer){
                     const newDemo = Math.max(0, (prof.demo_balance || 0) - bet);
                     await supabase.from('profiles').update({
-                      demo_balance: newDemo,
-                      total_wagered: (prof.total_wagered || 0) + bet
-                    }).eq('id', pl.user_id);
+                      demo_balance: newDemo
+                    }).eq('id', pl.user_id); // FIX demo không tính wager
                     await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -bet, room_id:roomId, description: `Thua ${bet} demo`}]);
                   } else {
                     const newBal = (prof.balance || 0) - bet;
@@ -2286,21 +2286,17 @@ io.on('connection', (socket)=>{
                       const deduct = Math.min(demoBal, bet);
                       const newDemo = Math.max(0, demoBal - deduct);
                       await supabase.from('profiles').update({
-                        demo_balance: newDemo,
-                        total_wagered: (prof.total_wagered || 0) + deduct
-                      }).eq('id', pl.user_id);
+                        demo_balance: newDemo
+                      }).eq('id', pl.user_id); // FIX demo không tính wager
                       await supabase.from('transactions').insert([{user_id: pl.user_id, type:'lose_demo', amount: -deduct, room_id:roomId, description: `Thua ${deduct} demo (thua người chơi demo)`}]);
                     } else {
-                      await supabase.from('profiles').update({
-                        total_wagered: (prof.total_wagered || 0) + bet
-                      }).eq('id', pl.user_id);
+                      // FIX: winner demo, loser không có demo thì không trừ và không tính wager
                     }
                   }
                   const newDemo = (winnerProf.demo_balance || 0) + winAmount;
                   await supabase.from('profiles').update({
-                    demo_balance: newDemo,
-                    total_wagered: (winnerProf.total_wagered || 0) + bet
-                  }).eq('id', p.user_id);
+                    demo_balance: newDemo
+                  }).eq('id', p.user_id); // FIX demo không tính wager
                   await supabase.from('transactions').insert([{user_id: p.user_id, type:'win_demo', amount: winAmount, room_id:roomId, description: `Thắng ${winAmount} demo - người thua chỉ mất demo (nếu có)`}]);
                 } else {
                   let demoPortion = 0;
@@ -3020,9 +3016,8 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
                 if(isDemo){
                   const newDemo = Math.max(0, (prof.demo_balance || 0) - betAmount);
                   await supabase.from('profiles').update({
-                    demo_balance: newDemo,
-                    total_wagered: (prof.total_wagered || 0) + betAmount
-                  }).eq('id', leavingUserId);
+                    demo_balance: newDemo
+                  }).eq('id', leavingUserId); // FIX demo không tính wager
                   await supabase.from('transactions').insert([{user_id: leavingUserId, type:'forfeit_demo', amount: -betAmount, room_id: leavingRoomId, description: `Rời phòng khi đang quay - mất ${betAmount} demo`}]);
                 } else {
                   if((prof.balance || 0) >= betAmount){
@@ -3151,10 +3146,10 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
                       const demoBal = prof.demo_balance || 0;
                       if(demoBal > 0){
                         const deduct = Math.min(demoBal, bet);
-                        await supabase.from('profiles').update({demo_balance: Math.max(0, demoBal-deduct), total_wagered: (prof.total_wagered||0)+deduct}).eq('id',pl.user_id);
+                        await supabase.from('profiles').update({demo_balance: Math.max(0, demoBal-deduct)}).eq('id',pl.user_id); // FIX demo không tính wager
                         await supabase.from('transactions').insert([{user_id: pl.user_id, type:'forfeit_demo', amount: -deduct, room_id: leavingRoomId, description: 'Thua demo (thua người chơi demo - last man)'}]);
                       } else {
-                        await supabase.from('profiles').update({total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                        // FIX: không trừ và không tính wager khi winner demo và loser không có demo
                       }
                     }
                   }
@@ -3168,7 +3163,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
                     const prof = await getProfileById(pl.user_id);
                     if(prof){
                       if(pl.is_demo){
-                        await supabase.from('profiles').update({demo_balance: Math.max(0, (prof.demo_balance||0)-bet), total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
+                        await supabase.from('profiles').update({demo_balance: Math.max(0, (prof.demo_balance||0)-bet)}).eq('id',pl.user_id); // FIX demo không tính wager
                       } else {
                         await supabase.from('profiles').update({balance: (prof.balance||0)-bet, total_wagered: (prof.total_wagered||0)+bet}).eq('id',pl.user_id);
                       }
@@ -3181,7 +3176,7 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
             const winnerProf = await getProfileById(winner.user_id);
             if(winnerProf){
               if(winner.is_demo){
-                await supabase.from('profiles').update({demo_balance: (winnerProf.demo_balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);
+                await supabase.from('profiles').update({demo_balance: (winnerProf.demo_balance||0)+winAmount}).eq('id',winner.user_id); // FIX demo không tính wager
                 await supabase.from('transactions').insert([{user_id: winner.user_id, type:'win_demo', amount: winAmount, room_id:leavingRoomId, description: 'Thắng demo last man - người thua chỉ mất demo nếu có'}]);
               } else {
                 await supabase.from('profiles').update({balance: (winnerProf.balance||0)+winAmount, total_wagered: (winnerProf.total_wagered||0)+bet}).eq('id',winner.user_id);

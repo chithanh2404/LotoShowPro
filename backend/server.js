@@ -2043,13 +2043,16 @@ io.on('connection', (socket)=>{
               const forfeitedCount = game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
               const totalPlayersForPot = Math.max(game.players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
               const totalPot = totalPlayersForPot * bet;
-              const fee = Math.floor(totalPot * feePercent / 100);
-              const netPot = totalPot - fee;
-              // CHIA ĐỀU
-              const share = Math.floor(netPot / winnersFound.length);
+              // FIX X2: chỉ tính tiền người THUA, không tính tiền người thắng
+              const losersCountMulti = Math.max(totalPlayersForPot - winnersFound.length, 0);
+              const losersPotMulti = losersCountMulti * bet;
+              const fee = Math.floor(losersPotMulti * feePercent / 100);
+              const netPot = losersPotMulti - fee;
+              // CHIA ĐỀU tiền thua (sau phí) cho người thắng
+              const share = winnersFound.length > 0 ? Math.floor(netPot / winnersFound.length) : 0;
               let remainder = netPot - share * winnersFound.length;
 
-              console.log(`[POT SPLIT] ${roomId} - totalPot=${totalPot} fee=${fee} net=${netPot} winners=${winnersFound.length} share=${share} remainder=${remainder}`);
+              console.log(`[POT SPLIT FIXED X2] ${roomId} - totalPot=${totalPot} losersCount=${losersCountMulti} losersPot=${losersPotMulti} fee=${fee} net=${netPot} winners=${winnersFound.length} share=${share} remainder=${remainder} (ĐÚNG: 2 người 2k phí 6% => 1880)`);
 
               // Trừ tiền những người thua (không phải winner)
               for(const pl of game.players){
@@ -2210,8 +2213,11 @@ io.on('connection', (socket)=>{
               const forfeitedCount = game.forfeitedPlayers ? game.forfeitedPlayers.length : 0;
               const totalPlayersForPot = Math.max(game.players.filter(pl=>!pl.is_bot).length + forfeitedCount, originalCount);
               const totalPot = totalPlayersForPot * bet;
-              const fee = Math.floor(totalPot * feePercent / 100);
-              const winAmount = totalPot - fee;
+              // FIX X2: win chỉ = tiền người thua trừ phí, không phải cả pot
+              const losersCountSingle = Math.max(totalPlayersForPot - 1, 0);
+              const losersPotSingle = losersCountSingle * bet;
+              const fee = Math.floor(losersPotSingle * feePercent / 100);
+              const winAmount = losersPotSingle - fee;
               
               const isBotWinner = p.is_bot;
               const isDemoWinnerEarly = p.is_demo;
@@ -3132,8 +3138,11 @@ socket.on('false-win-detected', ({roomId, winner, reason, drawnCount})=>{
             const feePercent = game.roomData.fee_percent;
             const originalCount = game.originalPlayers ? game.originalPlayers.length : (remainingPlayers.length + 1 + (game.forfeitedPlayers ? game.forfeitedPlayers.length : 0));
             const totalPot = originalCount * bet;
-            const fee = Math.floor(totalPot * feePercent / 100);
-            const winAmount = totalPot - fee;
+            // FIX X2 last man: chỉ nhận tiền người đã rời phòng (thua)
+            const losersCountLast = Math.max(originalCount - 1, 0);
+            const losersPotLast = losersCountLast * bet;
+            const fee = Math.floor(losersPotLast * feePercent / 100);
+            const winAmount = losersPotLast - fee;
             const winner = stillInRoom[0];
             // UPDATED per new spec: demo win -> losers only lose demo (if have)
             if(winner.is_demo){

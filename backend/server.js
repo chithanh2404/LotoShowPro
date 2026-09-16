@@ -418,6 +418,14 @@ app.post('/api/profile/change-password', async (req,res)=>{
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
+app.get('/api/user/profile', async (req,res)=>{
+  const userId = req.query.userId;
+  if(!userId) return res.status(400).json({error:'Missing userId'});
+  const {data, error} = await supabase.from('profiles').select('*').eq('id', userId).single();
+  if(error) return res.status(404).json({error:error.message});
+  res.json({ok:true, profile: data, balance: data.balance, demo_balance: data.demo_balance});
+});
+
 // ===== NEW: Withdrawal APIs =====
 app.post('/api/withdrawals/request', async (req,res)=>{
   try{

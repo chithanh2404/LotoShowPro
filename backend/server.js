@@ -304,7 +304,6 @@ async function getProfileById(userId){
     return null;
   }
 }
-}
 
 // ===== UTILS: Tạo vé Loto chuẩn Việt Nam =====
 function generateLotoTicket() {

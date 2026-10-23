@@ -206,9 +206,37 @@ async function getUsernameById(userId){
 
 async function getProfileById(userId){
   try{
-    const {data: profile} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
-    return profile;
-  }catch(e){ return null; }
+    const {data: profile, error} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+    if(error){
+      console.log('[getProfileById] error', error.message);
+      return null;
+    }
+    if(profile) return profile;
+    // Auto-create profile nếu chưa có (trường hợp user mới đăng ký nhưng chưa có trigger)
+    console.log('[getProfileById] profile not found, creating default for', userId);
+    const {data: userData} = await supabase.auth.admin.getUserById(userId);
+    const email = userData?.user?.email || '';
+    const username = email ? email.split('@')[0] : 'user_' + userId.slice(0,6);
+    const {data: newProfile, error: insErr} = await supabase.from('profiles').insert({
+      id: userId,
+      email,
+      username,
+      balance: 0,
+      demo_balance: 100000,
+      total_deposited: 0,
+      total_wagered: 0,
+      role: 'user'
+    }).select().single();
+    if(insErr){
+      console.log('[getProfileById] insert fail', insErr.message);
+      // trả về object tạm để frontend không bị rỗng
+      return {id: userId, email, username, balance: 0, demo_balance: 100000, total_deposited:0, total_wagered:0, role:'user'};
+    }
+    return newProfile;
+  }catch(e){ 
+    console.log('[getProfileById] exception', e.message);
+    return null; 
+  }
 }
 
 // ===== UTILS: Tạo vé Loto chuẩn Việt Nam =====
@@ -421,9 +449,14 @@ app.post('/api/profile/change-password', async (req,res)=>{
 app.get('/api/user/profile', async (req,res)=>{
   const userId = req.query.userId;
   if(!userId) return res.status(400).json({error:'Missing userId'});
-  const {data, error} = await supabase.from('profiles').select('*').eq('id', userId).single();
-  if(error) return res.status(404).json({error:error.message});
-  res.json({ok:true, profile: data, balance: data.balance, demo_balance: data.demo_balance});
+  try{
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({error:'Profile not found even after auto-create', userId});
+    res.json({ok:true, profile, balance: profile.balance, demo_balance: profile.demo_balance, ...profile});
+  }catch(e){
+    console.log('/api/user/profile error', e.message);
+    res.status(500).json({error:e.message});
+  }
 });
 
 // ===== NEW: Withdrawal APIs =====
@@ -787,6 +820,12 @@ app.get('/api/user/balance', async (req, res) => {
   try{
     const userId = req.query.userId;
     if(!userId) return res.status(400).json({error: 'Thieu userId'});
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({error:'Not found'});
+    res.json({balance: profile.balance||0, real_balance: profile.balance||0, demo_balance: profile.demo_balance||0, demoBalance: profile.demo_balance||0, realBalance: profile.balance||0, username: profile.username, id: profile.id, profile});
+  }catch(e){ res.status(500).json({error:e.message}); }
+});
+
     const { data, error } = await supabase.from('profiles').select('balance').eq('id', userId).single();
     if(error) return res.status(404).json({error: 'User not found'});
     res.json({ balance: data.balance || 0 });
@@ -3487,13 +3526,17 @@ app.post('/api/wallet/win', async (req,res)=>{
   }catch(e){ res.status(400).json({ok:false, error:e.message}); }
 });
 
-// Alias for /api/user/balance to ensure it works
+// Alias for /api/user/balance to ensure it works - FIXED with auto-create
 app.get('/api/user/balance', async (req,res)=>{
   const userId = req.query.userId;
   if(!userId) return res.status(400).json({error:'Missing userId'});
-  const {data} = await supabase.from('profiles').select('balance, demo_balance').eq('id', userId).single();
-  if(!data) return res.status(404).json({error:'Not found'});
-  res.json({balance: data.balance||0, real_balance: data.balance||0, demo_balance: data.demo_balance||0, demoBalance: data.demo_balance||0, realBalance: data.balance||0});
+  try{
+    const profile = await getProfileById(userId);
+    if(!profile) return res.status(404).json({error:'Not found', userId});
+    res.json({balance: profile.balance||0, real_balance: profile.balance||0, demo_balance: profile.demo_balance||0, demoBalance: profile.demo_balance||0, realBalance: profile.balance||0, username: profile.username, id: profile.id, profile});
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
 });
 
 app.get('/api/game/history/:userId', async(req,res)=>{

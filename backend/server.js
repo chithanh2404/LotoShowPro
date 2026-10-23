@@ -205,41 +205,105 @@ async function getUsernameById(userId){
 }
 
 async function getProfileById(userId){
+  console.log('=== [getProfileById] START for', userId, '===');
+  console.log('ENV check - SUPABASE_URL:', process.env.SUPABASE_URL ? 'SET ' + process.env.SUPABASE_URL.slice(0,30) : 'NOT SET');
+  console.log('ENV check - SERVICE_KEY:', process.env.SUPABASE_SERVICE_KEY ? 'SET len=' + process.env.SUPABASE_SERVICE_KEY.length : 'NOT SET');
   try{
-    const {data: profile, error} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
-    if(error){
-      console.log('[getProfileById] error', error.message);
-      return null;
+    // Test 1: Count all profiles to see if table accessible
+    const {data: countData, error: countErr} = await supabase.from('profiles').select('id', {count:'exact'}).limit(1);
+    console.log('[getProfileById] Test count - data:', countData?.length, 'error:', countErr?.message);
+
+    // Test 2: Select specific profile
+    const {data: profile, error: selErr} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+    if(selErr){
+      console.log('[getProfileById] SELECT error:', JSON.stringify(selErr));
+    } else {
+      console.log('[getProfileById] SELECT result:', profile ? 'FOUND ' + profile.username + ' balance=' + profile.balance : 'NULL (not found)');
     }
-    if(profile) return profile;
-    console.log('[getProfileById] profile not found, creating default for', userId);
+    if(profile){
+      return profile;
+    }
+
+    // If not found, try direct REST fetch as fallback to bypass supabase-js
     try{
-      const {data: userData} = await supabase.auth.admin.getUserById(userId);
-      const email = userData?.user?.email || '';
-      const username = email ? email.split('@')[0] : 'user_' + String(userId).slice(0,6);
-      const {data: newProfile, error: insErr} = await supabase.from('profiles').insert({
-        id: userId,
-        email,
-        username,
-        balance: 0,
-        demo_balance: 100000,
-        total_deposited: 0,
-        total_wagered: 0,
-        role: 'user'
-      }).select().single();
-      if(insErr){
-        console.log('[getProfileById] insert fail', insErr.message);
-        return {id: userId, email, username, balance: 0, demo_balance: 100000, total_deposited:0, total_wagered:0, role:'user'};
-      }
-      return newProfile;
-    }catch(createErr){
-      console.log('[getProfileById] create exception', createErr.message);
-      return {id: userId, username: 'user_' + String(userId).slice(0,6), balance: 0, demo_balance: 100000, total_deposited:0, total_wagered:0, role:'user'};
+      console.log('[getProfileById] Trying direct REST fetch...');
+      const restUrl = process.env.SUPABASE_URL + '/rest/v1/profiles?id=eq.' + userId + '&select=*';
+      const restResp = await fetch(restUrl, {
+        headers: {
+          'apikey': process.env.SUPABASE_SERVICE_KEY,
+          'Authorization': 'Bearer ' + process.env.SUPABASE_SERVICE_KEY
+        }
+      });
+      const restText = await restResp.text();
+      console.log('[getProfileById] REST status', restResp.status, 'body', restText.slice(0,500));
+      try{
+        const restJson = JSON.parse(restText);
+        if(Array.isArray(restJson) && restJson.length>0){
+          console.log('[getProfileById] REST FOUND via direct fetch');
+          return restJson[0];
+        }
+      }catch(e){}
+    }catch(restEx){
+      console.log('[getProfileById] REST fetch exception', restEx.message);
     }
+
+    console.log('[getProfileById] Profile truly not found, attempting to CREATE real profile for', userId);
+    
+    // Get email from auth
+    let email = null;
+    let baseUsername = 'user_' + String(userId).slice(0,8);
+    try{
+      const {data: userData, error: authErr} = await supabase.auth.admin.getUserById(userId);
+      if(authErr){
+        console.log('[getProfileById] auth.admin.getUserById error:', authErr.message);
+      } else {
+        email = userData?.user?.email || null;
+        if(email){
+          baseUsername = email.split('@')[0].replace(/[^a-zA-Z0-9_]/g,'').slice(0,20) || baseUsername;
+        }
+        console.log('[getProfileById] Got auth email:', email, 'baseUsername:', baseUsername);
+      }
+    }catch(authEx){
+      console.log('[getProfileById] auth exception:', authEx.message);
+    }
+
+    // Try insert with retries for duplicate username
+    for(let attempt=0; attempt<5; attempt++){
+      const tryUsername = attempt===0 ? baseUsername : baseUsername + '_' + Math.floor(Math.random()*100000);
+      console.log('[getProfileById] INSERT attempt', attempt, 'username', tryUsername);
+      try{
+        const {data: newProfile, error: insErr} = await supabase.from('profiles').insert({
+          id: userId,
+          email: email,
+          username: tryUsername,
+          balance: 0,
+          demo_balance: 100000,
+          total_deposited: 0,
+          total_wagered: 0,
+          role: 'user'
+        }).select().single();
+        
+        if(insErr){
+          console.log('[getProfileById] INSERT fail attempt', attempt, ':', JSON.stringify(insErr));
+          if(insErr.code === '23505' && attempt < 4) continue;
+          if(attempt === 4){
+            console.log('[getProfileById] All inserts failed, will return null to trigger detailed error');
+            return null;
+          }
+          continue;
+        }
+        console.log('[getProfileById] INSERT SUCCESS', newProfile.id, newProfile.username);
+        return newProfile;
+      }catch(insEx){
+        console.log('[getProfileById] INSERT exception attempt', attempt, ':', insEx.message);
+      }
+    }
+    return null;
   }catch(e){ 
-    console.log('[getProfileById] exception', e.message);
-    return null; 
+    console.log('[getProfileById] OUTER exception', e.message, e.stack?.slice(0,1000));
+    return null;
   }
+}
 }
 
 // ===== UTILS: Tạo vé Loto chuẩn Việt Nam =====
@@ -415,16 +479,23 @@ app.get('/api/auth/confirm-all', async (req,res)=>{
 app.get('/api/profile/:userId', async (req,res)=>{
   try{
     const {userId} = req.params;
+    console.log('[API /api/profile/:userId] request for', userId);
     const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({error:'Profile not found'});
-    // Ensure demo_balance exists
+    if(!profile){
+      console.log('[API /api/profile/:userId] FAILED for', userId);
+      return res.status(404).json({error:'Profile not found - auto-create failed, check logs', userId});
+    }
+    console.log('[API /api/profile/:userId] SUCCESS', profile.id);
     const demo_balance = profile.demo_balance !== undefined ? profile.demo_balance : 100000;
     const balance = profile.balance || 0;
     const total_deposited = profile.total_deposited || 0;
     const total_wagered = profile.total_wagered || 0;
     const role = profile.role || 'user';
     res.json({...profile, demo_balance, balance, total_deposited, total_wagered, role, total_balance: balance + demo_balance});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ 
+    console.log('[API /api/profile/:userId] exception', e.message);
+    res.status(500).json({error:e.message}); 
+  }
 });
 
 app.post('/api/profile/bank', async (req,res)=>{
@@ -453,12 +524,23 @@ app.get('/api/user/profile', async (req,res)=>{
   const userId = req.query.userId;
   if(!userId) return res.status(400).json({error:'Missing userId'});
   try{
+    console.log('[API /api/user/profile] request for', userId);
     const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({error:'Profile not found even after auto-create', userId});
+    if(!profile){
+      console.log('[API /api/user/profile] FAILED to get/create profile for', userId);
+      return res.status(404).json({
+        error:'Profile not found and auto-create failed - check server logs for [getProfileById]',
+        userId,
+        hint: '1) Check Render logs for SELECT/INSERT errors, 2) Check if table has extra NOT NULL columns, 3) Run SQL to create profile manually',
+        supabaseUrl: process.env.SUPABASE_URL ? 'set' : 'NOT SET',
+        serviceKey: process.env.SUPABASE_SERVICE_KEY ? 'set' : 'NOT SET'
+      });
+    }
+    console.log('[API /api/user/profile] SUCCESS', profile.id, profile.username, 'balance', profile.balance);
     res.json({ok:true, profile, balance: profile.balance, demo_balance: profile.demo_balance, ...profile});
   }catch(e){
-    console.log('/api/user/profile error', e.message);
-    res.status(500).json({error:e.message});
+    console.log('[API /api/user/profile] exception', e.message);
+    res.status(500).json({error:e.message, userId});
   }
 });
 
@@ -822,15 +904,43 @@ app.get('/api/deposit/history', async (req, res) => {
 
 
 
-// API: Lay so du user - FIXED with auto-create (single endpoint)
+// API: Lay so du user - FIXED real profile
 app.get('/api/user/balance', async (req, res) => {
   try{
     const userId = req.query.userId;
     if(!userId) return res.status(400).json({error: 'Thieu userId'});
+    console.log('[API /api/user/balance] request for', userId);
     const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({error:'Not found', userId});
+    if(!profile){
+      console.log('[API /api/user/balance] FAILED for', userId);
+      return res.status(404).json({error:'Not found - auto-create failed, check logs', userId});
+    }
+    console.log('[API /api/user/balance] SUCCESS', profile.id, 'balance', profile.balance);
     res.json({balance: profile.balance||0, real_balance: profile.balance||0, demo_balance: profile.demo_balance||0, demoBalance: profile.demo_balance||0, realBalance: profile.balance||0, username: profile.username, id: profile.id, profile});
-  }catch(e){ res.status(500).json({error:e.message}); }
+  }catch(e){ 
+    console.log('[API /api/user/balance] exception', e.message);
+    res.status(500).json({error:e.message}); 
+  }
+});
+
+// DEBUG endpoint to check Supabase connectivity
+app.get('/api/debug/check/:userId', async (req,res)=>{
+  try{
+    const userId = req.params.userId;
+    const {data: countData, error: countErr} = await supabase.from('profiles').select('id', {count:'exact'}).limit(1);
+    const {data: profile, error: selErr} = await supabase.from('profiles').select('*').eq('id', userId).maybeSingle();
+    res.json({
+      env: {
+        url: process.env.SUPABASE_URL,
+        serviceKeySet: !!process.env.SUPABASE_SERVICE_KEY,
+        serviceKeyLen: process.env.SUPABASE_SERVICE_KEY?.length
+      },
+      countTest: {error: countErr?.message, count: countData?.length},
+      selectTest: {error: selErr?.message, found: !!profile, profile: profile ? {id: profile.id, username: profile.username, balance: profile.balance} : null}
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
 });
 
 
@@ -3528,7 +3638,6 @@ app.post('/api/wallet/win', async (req,res)=>{
   }catch(e){ res.status(400).json({ok:false, error:e.message}); }
 });
 
-// Alias for /api/user/balance to ensure it works
 
 
 

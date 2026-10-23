@@ -212,27 +212,30 @@ async function getProfileById(userId){
       return null;
     }
     if(profile) return profile;
-    // Auto-create profile nếu chưa có (trường hợp user mới đăng ký nhưng chưa có trigger)
     console.log('[getProfileById] profile not found, creating default for', userId);
-    const {data: userData} = await supabase.auth.admin.getUserById(userId);
-    const email = userData?.user?.email || '';
-    const username = email ? email.split('@')[0] : 'user_' + userId.slice(0,6);
-    const {data: newProfile, error: insErr} = await supabase.from('profiles').insert({
-      id: userId,
-      email,
-      username,
-      balance: 0,
-      demo_balance: 100000,
-      total_deposited: 0,
-      total_wagered: 0,
-      role: 'user'
-    }).select().single();
-    if(insErr){
-      console.log('[getProfileById] insert fail', insErr.message);
-      // trả về object tạm để frontend không bị rỗng
-      return {id: userId, email, username, balance: 0, demo_balance: 100000, total_deposited:0, total_wagered:0, role:'user'};
+    try{
+      const {data: userData} = await supabase.auth.admin.getUserById(userId);
+      const email = userData?.user?.email || '';
+      const username = email ? email.split('@')[0] : 'user_' + String(userId).slice(0,6);
+      const {data: newProfile, error: insErr} = await supabase.from('profiles').insert({
+        id: userId,
+        email,
+        username,
+        balance: 0,
+        demo_balance: 100000,
+        total_deposited: 0,
+        total_wagered: 0,
+        role: 'user'
+      }).select().single();
+      if(insErr){
+        console.log('[getProfileById] insert fail', insErr.message);
+        return {id: userId, email, username, balance: 0, demo_balance: 100000, total_deposited:0, total_wagered:0, role:'user'};
+      }
+      return newProfile;
+    }catch(createErr){
+      console.log('[getProfileById] create exception', createErr.message);
+      return {id: userId, username: 'user_' + String(userId).slice(0,6), balance: 0, demo_balance: 100000, total_deposited:0, total_wagered:0, role:'user'};
     }
-    return newProfile;
   }catch(e){ 
     console.log('[getProfileById] exception', e.message);
     return null; 
@@ -815,22 +818,21 @@ app.get('/api/deposit/history', async (req, res) => {
   }catch(e){ res.status(500).json({error: e.message}); }
 });
 
-// API: Lay so du user
+
+
+
+
+// API: Lay so du user - FIXED with auto-create (single endpoint)
 app.get('/api/user/balance', async (req, res) => {
   try{
     const userId = req.query.userId;
     if(!userId) return res.status(400).json({error: 'Thieu userId'});
     const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({error:'Not found'});
+    if(!profile) return res.status(404).json({error:'Not found', userId});
     res.json({balance: profile.balance||0, real_balance: profile.balance||0, demo_balance: profile.demo_balance||0, demoBalance: profile.demo_balance||0, realBalance: profile.balance||0, username: profile.username, id: profile.id, profile});
   }catch(e){ res.status(500).json({error:e.message}); }
 });
 
-    const { data, error } = await supabase.from('profiles').select('balance').eq('id', userId).single();
-    if(error) return res.status(404).json({error: 'User not found'});
-    res.json({ balance: data.balance || 0 });
-  }catch(e){ res.status(500).json({error: e.message}); }
-});
 
 // API: Webhook Sepay - Tu dong duyet khi chuyen khoan thanh cong
 // Sepay se gui POST den https://lotoshowpro.onrender.com/api/sepay/webhook
@@ -3526,18 +3528,9 @@ app.post('/api/wallet/win', async (req,res)=>{
   }catch(e){ res.status(400).json({ok:false, error:e.message}); }
 });
 
-// Alias for /api/user/balance to ensure it works - FIXED with auto-create
-app.get('/api/user/balance', async (req,res)=>{
-  const userId = req.query.userId;
-  if(!userId) return res.status(400).json({error:'Missing userId'});
-  try{
-    const profile = await getProfileById(userId);
-    if(!profile) return res.status(404).json({error:'Not found', userId});
-    res.json({balance: profile.balance||0, real_balance: profile.balance||0, demo_balance: profile.demo_balance||0, demoBalance: profile.demo_balance||0, realBalance: profile.balance||0, username: profile.username, id: profile.id, profile});
-  }catch(e){
-    res.status(500).json({error:e.message});
-  }
-});
+// Alias for /api/user/balance to ensure it works
+
+
 
 app.get('/api/game/history/:userId', async(req,res)=>{
   const {userId}=req.params;

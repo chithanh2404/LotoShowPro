@@ -1,9 +1,3 @@
-// ===== FIX BUG 1 - 3 BUGS FIXED VERSION =====
-// Bug1: Respect isDemo flag - prioritize real balance, don't force demo for admin
-// Bug2: Confetti only when number hits ticket (frontend fix in theme)
-// Bug3: Host ready state fix (frontend fix in theme + server readyMap handling)
-// Server change: Ensure deduction logic uses is_demo from client, not auto demo
-
 import express from 'express';
 import cors from 'cors';
 import { createClient } from '@supabase/supabase-js';
@@ -1120,7 +1114,7 @@ app.post('/api/rooms', async (req,res)=>{
     // continue with data2
     const username = await getUsernameById(hostId);
     const ticketColor = req.body.ticketColor || '#00d2ff';
-    const is_demo = !!isDemo; // BUG1 FIX: respect client flag, admin with real balance will have is_demo=false
+    const is_demo = !!isDemo;
     if(!isCaro){
       const finalTicket = ticket || generateLotoTicket();
       await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
@@ -1136,7 +1130,16 @@ app.post('/api/rooms', async (req,res)=>{
   }
   const username = await getUsernameById(hostId);
   const ticketColor = req.body.ticketColor || (isCaro ? '#ff6b35' : '#00d2ff');
-  const is_demo = !!isDemo; // BUG1 FIX: respect client flag, admin with real balance will have is_demo=false
+  let is_demo = !!isDemo;
+  try{
+    const profHost = await getProfileById(hostId);
+    const betHost = betAmount||0;
+    if(profHost){
+      if((profHost.balance||0) >= betHost) is_demo = false;
+      else if((profHost.demo_balance||0) >= betHost) is_demo = true;
+      console.log(`[CREATE ROOM BUG1 FIX] host=${hostId} real=${profHost.balance} demo=${profHost.demo_balance} bet=${betHost} final is_demo=${is_demo}`);
+    }
+  }catch(e){}
   if(!isCaro){
     const finalTicket = ticket || generateLotoTicket();
     await supabase.from('room_players').insert({room_id:id, user_id:hostId, username: username, ticket: finalTicket, ticket_color: ticketColor, is_bot:false, is_demo});
@@ -1395,7 +1398,7 @@ async function finalizeForfeitAndKick(roomId, userId, username){
             const playerInGame = game.originalPlayers ? game.originalPlayers.find(pl=>pl.user_id===userId) : null;
             const isDemo = playerInGame ? playerInGame.is_demo : false;
             if(isDemo){
-              await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-betAmount)}).eq('id', userId); // FIX demo không tính wager - BUG1: only when isDemo=true
+              await supabase.from('profiles').update({demo_balance: Math.max(0,(prof.demo_balance||0)-betAmount)}).eq('id', userId); // FIX demo không tính wager
             } else {
               if((prof.balance||0) >= betAmount){
                 await supabase.from('profiles').update({balance: prof.balance - betAmount, total_wagered: (prof.total_wagered||0)+betAmount}).eq('id', userId);
@@ -1529,7 +1532,20 @@ io.on('connection', (socket)=>{
       const finalTicket = ticket || generateLotoTicket();
       const username = await getUsernameById(userId);
       const color = ticketColor || '#'+Math.floor(Math.random()*16777215).toString(16);
-      const is_demo = !!isDemo; // BUG1 FIX: respect client flag, admin with real balance will have is_demo=false
+      // FIX BUG 1 - Server recalc is_demo based on real balance vs room bet, not just client flag
+      let is_demo = !!isDemo;
+      try{
+        const prof = await getProfileById(userId);
+        const betToCheck = room.bet_amount || room.bet || 0;
+        if(prof){
+          const realBal = prof.balance||0;
+          const demoBal = prof.demo_balance||0;
+          // Ưu tiên thật
+          if(realBal >= betToCheck) is_demo = false;
+          else if(demoBal >= betToCheck) is_demo = true;
+          console.log(`[JOIN BUG1 FIX] user=${userId} real=${realBal} demo=${demoBal} bet=${betToCheck} clientIsDemo=${!!isDemo} => final is_demo=${is_demo}`);
+        }
+      }catch(e){ console.log('[JOIN BUG1 calc error]', e.message); }
       await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: finalTicket, ticket_color: color, is_bot:false, is_demo});
     } else if(existList.length>1){
       for(let i=1;i<existList.length;i++){
@@ -1879,7 +1895,16 @@ io.on('connection', (socket)=>{
     await supabase.from('rooms').insert({id:roomId, host_id:userId, bet_amount:betAmount, max_players:botCount+1, fee_percent:fee, status:'waiting', name:`Solo ${botCount} bot`});
     const username = await getUsernameById(userId);
     const color = ticketColor || '#00d2ff';
-    const is_demo = !!isDemo; // BUG1 FIX: respect client flag, admin with real balance will have is_demo=false
+    let is_demo = !!isDemo;
+    try{
+      const profSolo = await getProfileById(userId);
+      const betSolo = betAmount||0;
+      if(profSolo){
+        if((profSolo.balance||0) >= betSolo) is_demo = false;
+        else if((profSolo.demo_balance||0) >= betSolo) is_demo = true;
+        console.log(`[SOLO BUG1 FIX] user=${userId} real=${profSolo.balance} demo=${profSolo.demo_balance} bet=${betSolo} final is_demo=${is_demo}`);
+      }
+    }catch(e){}
     await supabase.from('room_players').insert({room_id:roomId, user_id:userId, username: username, ticket: ticket || generateLotoTicket(), ticket_color: color, is_bot:false, is_demo});
     const botColors = ['#ff6b35','#9c27b0','#00bcd4','#e91e63','#4caf50','#ff9800'];
     for(let i=0;i<botCount;i++){

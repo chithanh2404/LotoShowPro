@@ -1488,31 +1488,40 @@ function scheduleReconnectCheck(roomId, userId, username){
 io.on('connection', (socket)=>{
   console.log('socket connected', socket.id);
 
-  socket.on('join-room', async ({roomId, userId, password, ticket, ticketColor, isDemo})=>{
+  socket.on('join-room', async ({roomId, userId, password, ticket, ticketColor, isDemo, isRejoin})=>{
     const {data: room} = await supabase.from('rooms').select('*').eq('id',roomId).single();
     if(!room) return socket.emit('error','Phòng không tồn tại');
 
     const reconnectKey = getReconnectKey(roomId, userId);
     const isReconnecting = reconnectingPlayers.has(reconnectKey);
     let isRejoinAfterDisconnect = false;
+    let isExistingPlayer = false;
+
+    // Kiểm tra user đã có trong phòng chưa (để cho phép rejoin khi sập nguồn/đóng nhầm app)
+    const {data: checkExisting} = await supabase.from('room_players').select('id').eq('room_id', roomId).eq('user_id', userId).maybeSingle();
+    if(checkExisting) isExistingPlayer = true;
+
     if(isReconnecting){
-      console.log(`[RECONNECT] ${roomId} - ${userId} is reconnecting, allowing join during playing`);
+      console.log(`[RECONNECT] ${roomId} - ${userId} is reconnecting via grace period, allowing join during playing`);
       const recEntry = reconnectingPlayers.get(reconnectKey);
       if(recEntry && recEntry.timer) clearTimeout(recEntry.timer);
       reconnectingPlayers.delete(reconnectKey);
       isRejoinAfterDisconnect = true;
     } else {
       const existingGame = activeGames.get(roomId);
-      if(room.status === 'playing' || room.status === 'counting' || (existingGame && existingGame.isDrawing)){
-        const {data: alreadyInRoom} = await supabase.from('room_players').select('id').eq('room_id', roomId).eq('user_id', userId).maybeSingle();
-        if(!alreadyInRoom){
-          console.log(`[JOIN BLOCKED] ${roomId} - Room is playing/counting, blocking join for ${userId}`);
-          return socket.emit('join-blocked-playing', {roomId, message: 'Phòng đang quay số, vui lòng chờ ván sau!'});
+      const isRoomPlaying = (room.status === 'playing' || room.status === 'counting' || (existingGame && existingGame.isDrawing));
+      if(isRoomPlaying){
+        if(isExistingPlayer){
+          console.log(`[REJOIN ALLOWED] ${roomId} - ${userId} is existing player, allowing rejoin during playing (crash recovery)`);
+          isRejoinAfterDisconnect = true;
+        } else {
+          console.log(`[JOIN BLOCKED] ${roomId} - Room is playing/counting, blocking new user ${userId}`);
+          return socket.emit('join-blocked-playing', {roomId, message: 'Phòng đang quay số, vui lòng chờ ván sau! Chỉ người đang chơi mới được vào lại.'});
         }
-        isRejoinAfterDisconnect = true;
       }
     }
-    if(room.password && room.password!==password) return socket.emit('error','Sai mật khẩu phòng');
+    // Bỏ qua check mật khẩu cho người đã trong phòng vào lại (quên pass sau khi crash)
+    if(!isRejoinAfterDisconnect && room.password && room.password!==password) return socket.emit('error','Sai mật khẩu phòng');
     socket.join(roomId);
     socket.data.userId = userId;
     socket.data.roomId = roomId;
